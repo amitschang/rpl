@@ -108,11 +108,11 @@ impl<T: DataTransport> BatchScheduler<T> {
                     origin_queues.insert(node, pred_queues);
                 }
                 BatchMode::CommonOrigin => {
-                    // With 0 or 1 predecessors, CommonOrigin degrades to MaxRows(1).
-                    batch_modes.insert(node, BatchMode::MaxRows(1));
+                    // With 0 or 1 predecessors, CommonOrigin degrades to Passthrough.
+                    batch_modes.insert(node, BatchMode::Passthrough);
                     queues.insert(node, VecDeque::new());
                 }
-                BatchMode::MaxRows(_) => {
+                BatchMode::MaxRows(_) | BatchMode::Passthrough => {
                     queues.insert(node, VecDeque::new());
                 }
             }
@@ -192,7 +192,7 @@ impl<T: DataTransport> BatchScheduler<T> {
                     .unwrap()
                     .push_back(tagged);
             }
-            BatchMode::MaxRows(_) => {
+            BatchMode::MaxRows(_) | BatchMode::Passthrough => {
                 self.queues.get_mut(&node).unwrap().push_back(tagged);
             }
         }
@@ -206,6 +206,11 @@ impl<T: DataTransport> BatchScheduler<T> {
     pub fn next_ready_task(&mut self) -> Option<ReadyTask<T::Handle>> {
         for &node in &self.ranked_order.clone() {
             match &self.batch_modes[&node].clone() {
+                BatchMode::Passthrough => {
+                    if let Some(ready) = self.check_passthrough(node) {
+                        return Some(ready);
+                    }
+                }
                 BatchMode::MaxRows(max_rows) => {
                     if let Some(ready) = self.check_max_rows(node, *max_rows) {
                         return Some(ready);
@@ -219,6 +224,20 @@ impl<T: DataTransport> BatchScheduler<T> {
             }
         }
         None
+    }
+
+    /// Check if a Passthrough node is ready to fire.
+    ///
+    /// Returns the next single batch from the queue — no accumulation.
+    fn check_passthrough(&mut self, node: NodeIndex) -> Option<ReadyTask<T::Handle>> {
+        let queue = self.queues.get_mut(&node)?;
+        let tagged = queue.pop_front()?;
+        let origins = tagged.origins.clone();
+        Some(ReadyTask {
+            node,
+            handles: vec![tagged],
+            origins,
+        })
     }
 
     /// Check if a MaxRows node is ready to fire.
@@ -240,14 +259,16 @@ impl<T: DataTransport> BatchScheduler<T> {
             return None;
         }
 
-        // Drain batches up to the threshold.
+        // Drain batches up to the threshold, never exceeding max_rows.
+        // A single oversized batch is still returned alone (the executor
+        // will split it before execution).
         let queue = self.queues.get_mut(&node).unwrap();
         let mut handles = Vec::new();
         let mut collected_rows = 0;
         let mut origins = BTreeSet::new();
 
-        while let Some(_) = queue.front() {
-            if !handles.is_empty() && collected_rows >= max_rows {
+        while let Some(front) = queue.front() {
+            if !handles.is_empty() && collected_rows + front.num_rows > max_rows {
                 break;
             }
             let tagged = queue.pop_front().unwrap();

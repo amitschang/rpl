@@ -37,24 +37,25 @@ pub struct Resources {
     pub custom: HashMap<String, u32>,
 }
 
-/// Controls how incoming batches are accumulated before a task executes.
-#[derive(Debug, Clone)]
+/// Controls how incoming batches are accumulated before a task executes,
+/// and whether outputs are split to respect a row limit.
+#[derive(Debug, Clone, Default)]
 pub enum BatchMode {
+    /// Pass each incoming batch through as-is — no accumulation, no
+    /// splitting. This is the default.
+    #[default]
+    Passthrough,
+
     /// Accumulate incoming batches until total rows >= N, then concatenate
-    /// and execute. `MaxRows(1)` means process each batch individually
-    /// (the default). A single batch exceeding N rows passes through as-is.
+    /// and execute. After execution, if the output exceeds N rows it is
+    /// split into chunks of at most N rows before delivery to successors.
+    /// N must be >= 1.
     MaxRows(usize),
 
     /// Collect contributions from ALL predecessor branches covering the same
     /// origin set before executing. Used at merge points in the DAG where
     /// you need the full picture from every upstream path.
     CommonOrigin,
-}
-
-impl Default for BatchMode {
-    fn default() -> Self {
-        BatchMode::MaxRows(1)
-    }
 }
 
 /// A task definition within a pipeline graph.
@@ -160,14 +161,24 @@ impl TaskDef {
     }
 
     /// Set batch mode.
+    ///
+    /// # Panics
+    /// Panics if `batch_mode` is `MaxRows(0)`.
     pub fn with_batch_mode(mut self, batch_mode: BatchMode) -> Self {
+        if let BatchMode::MaxRows(0) = batch_mode {
+            panic!("MaxRows(0) is invalid: batch size must be >= 1");
+        }
         self.batch_mode = batch_mode;
         self
     }
 
     /// Set batch size (sugar for `BatchMode::MaxRows(n)`).
-    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
-        self.batch_mode = BatchMode::MaxRows(batch_size);
+    ///
+    /// # Panics
+    /// Panics if `n` is 0.
+    pub fn with_batch_size(mut self, n: usize) -> Self {
+        assert!(n > 0, "MaxRows(0) is invalid: batch size must be >= 1");
+        self.batch_mode = BatchMode::MaxRows(n);
         self
     }
 

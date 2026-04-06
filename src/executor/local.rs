@@ -1,9 +1,11 @@
 use std::collections::VecDeque;
 
+use crate::batch_ext::RecordBatchExt;
 use crate::error::Result;
 use crate::executor::scheduler::BatchScheduler;
 use crate::executor::{Executor, OutputBatch, SourceGenerator};
 use crate::graph::PipelineGraph;
+use crate::task::BatchMode;
 use crate::transport::DataTransport;
 use crate::transport::memory::InMemoryTransport;
 
@@ -131,39 +133,52 @@ impl<'a> LocalIter<'a> {
                 return true;
             }
 
-            // Execute the task.
+            // Split oversized input for MaxRows tasks so the task never
+            // receives more than `n` rows.
             let task = self.graph.task(node_idx);
-            let output = match task.execute(input) {
-                Ok(batch) => batch,
-                Err(e) => {
-                    self.pending_outputs.push_back(Err(e));
-                    self.done = true;
-                    return true;
-                }
+            let input_chunks: Vec<_> = match &task.batch_mode {
+                BatchMode::MaxRows(n) if input.num_rows() > *n => input.split(*n),
+                _ => vec![input],
             };
 
-            let num_rows = output.num_rows();
-            let is_sink = self.graph.is_sink(node_idx);
-
-            if is_sink {
-                self.pending_outputs.push_back(Ok(OutputBatch {
-                    data: output,
-                    task: task.name.clone(),
-                }));
-            } else {
-                // Store output and route to successors.
-                let handle = match self.scheduler.transport().store(&output) {
-                    Ok(h) => h,
+            for input_chunk in input_chunks {
+                // Execute the task on each chunk.
+                let output = match task.execute(input_chunk) {
+                    Ok(batch) => batch,
                     Err(e) => {
                         self.pending_outputs.push_back(Err(e));
                         self.done = true;
                         return true;
                     }
                 };
-                if let Err(e) = self.scheduler.deliver_output(node_idx, handle, origins, num_rows) {
-                    self.pending_outputs.push_back(Err(e));
-                    self.done = true;
-                    return true;
+
+                let num_rows = output.num_rows();
+                let is_sink = self.graph.is_sink(node_idx);
+
+                if is_sink {
+                    self.pending_outputs.push_back(Ok(OutputBatch {
+                        data: output,
+                        task: task.name.clone(),
+                    }));
+                } else {
+                    let handle = match self.scheduler.transport().store(&output) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            self.pending_outputs.push_back(Err(e));
+                            self.done = true;
+                            return true;
+                        }
+                    };
+                    if let Err(e) = self.scheduler.deliver_output(
+                        node_idx,
+                        handle,
+                        origins.clone(),
+                        num_rows,
+                    ) {
+                        self.pending_outputs.push_back(Err(e));
+                        self.done = true;
+                        return true;
+                    }
                 }
             }
 
@@ -223,11 +238,9 @@ mod tests {
 
     #[test]
     fn simple_linear_pipeline() {
-        // generate -> add_column -> sink
         let mut graph = PipelineGraph::new();
         graph
             .add_linear(vec![
-                TaskDef::passthrough("generate", |batch| Ok(batch)),
                 TaskDef::new(
                     "add_value",
                     Schema::empty(),
@@ -238,7 +251,6 @@ mod tests {
                         batch.append_column("value", Arc::new(Float64Array::from(values)))
                     },
                 ),
-                TaskDef::passthrough("sink", |batch| Ok(batch)),
             ])
             .unwrap();
 
@@ -297,10 +309,9 @@ mod tests {
 
     #[test]
     fn diamond_graph_execution() {
-        // a -> b -> d
-        // a -> c -> d
+        // b -> d
+        // c -> d
         let mut graph = PipelineGraph::new();
-        let a = graph.add_task(TaskDef::passthrough("source", |batch| Ok(batch)));
         let b = graph.add_task(TaskDef::new(
             "branch_b",
             Schema::empty(),
@@ -320,8 +331,6 @@ mod tests {
             },
         ));
         let d = graph.add_task(TaskDef::passthrough("merge", |batch| Ok(batch)));
-        graph.add_edge(a, b).unwrap();
-        graph.add_edge(a, c).unwrap();
         graph.add_edge(b, d).unwrap();
         graph.add_edge(c, d).unwrap();
 
@@ -353,7 +362,6 @@ mod tests {
         let mut graph = PipelineGraph::new();
         graph
             .add_linear(vec![
-                TaskDef::passthrough("gen", |b| Ok(b)),
                 TaskDef::new_with_config(
                     "scale",
                     schema(&[("id", DataType::Int64)]),
@@ -376,14 +384,15 @@ mod tests {
 
     #[test]
     fn max_rows_accumulation() {
-        // source -> accumulate(MaxRows(3)) -> sink
-        // 5 source batches of 1 row each -> expect 2 sink outputs: 3 rows, then 2 rows.
+        // source -> accumulate(MaxRows(3))
+        // 5 source batches of 1 row each -> expect 2 outputs: 3 rows, then 2 rows.
+        // The source passthrough is needed so individual batches flow into
+        // the accumulator across multiple scheduling rounds.
         let mut graph = PipelineGraph::new();
         graph
             .add_linear(vec![
                 TaskDef::passthrough("source", |b| Ok(b)),
                 TaskDef::passthrough("accumulate", |b| Ok(b)).with_batch_size(3),
-                TaskDef::passthrough("sink", |b| Ok(b)),
             ])
             .unwrap();
 
@@ -409,11 +418,10 @@ mod tests {
     fn common_origin_diamond() {
         use crate::task::BatchMode;
 
-        // A -> B -> D(CommonOrigin)
-        // A -> C -> D
+        // B -> D(CommonOrigin)
+        // C -> D
         // D should receive one merged output per source batch (from both B and C).
         let mut graph = PipelineGraph::new();
-        let a = graph.add_task(TaskDef::passthrough("source", |b| Ok(b)));
         let b = graph.add_task(TaskDef::new(
             "branch_b",
             Schema::empty(),
@@ -436,8 +444,6 @@ mod tests {
             TaskDef::passthrough("merge", |b| Ok(b))
                 .with_batch_mode(BatchMode::CommonOrigin),
         );
-        graph.add_edge(a, b).unwrap();
-        graph.add_edge(a, c).unwrap();
         graph.add_edge(b, d).unwrap();
         graph.add_edge(c, d).unwrap();
 
@@ -458,5 +464,108 @@ mod tests {
             assert_eq!(batch.num_rows(), 2);
             assert_eq!(result.as_ref().unwrap().task, "merge");
         }
+    }
+
+    #[test]
+    fn input_splitting() {
+        use crate::task::BatchMode;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // source -> process(MaxRows(3)) -> sink
+        // Source emits 1 batch of 10 rows. The process task has MaxRows(3),
+        // so the 10-row input is split before execution: 3+3+3+1.
+        // The task should never see more than 3 rows at a time.
+        let id_schema = schema(&[("id", DataType::Int64)]);
+
+        struct BigSource {
+            schema: Schema,
+            emitted: bool,
+        }
+        impl SourceGenerator for BigSource {
+            fn produces(&self) -> &Schema {
+                &self.schema
+            }
+            fn next_batch(&mut self) -> Option<RecordBatch> {
+                if self.emitted {
+                    return None;
+                }
+                self.emitted = true;
+                let ids: Vec<i64> = (0..10).collect();
+                Some(
+                    RecordBatch::try_new(
+                        Arc::new(self.schema.clone()),
+                        vec![Arc::new(Int64Array::from(ids))],
+                    )
+                    .unwrap(),
+                )
+            }
+        }
+
+        let max_seen = Arc::new(AtomicUsize::new(0));
+        let max_seen_clone = max_seen.clone();
+
+        let mut graph = PipelineGraph::new();
+        graph
+            .add_linear(vec![
+                TaskDef::passthrough("process", move |b: RecordBatch| {
+                    max_seen_clone.fetch_max(b.num_rows(), Ordering::Relaxed);
+                    Ok(b)
+                })
+                .with_batch_mode(BatchMode::MaxRows(3)),
+            ])
+            .unwrap();
+
+        let mut executor = LocalExecutor::new();
+        let mut source = BigSource {
+            schema: id_schema,
+            emitted: false,
+        };
+        let results: Vec<_> = executor.run(&graph, &mut source).unwrap().collect();
+
+        // Task never saw more than 3 rows.
+        assert!(max_seen.load(Ordering::Relaxed) <= 3);
+
+        // Sink receives 4 outputs: 3+3+3+1.
+        assert_eq!(results.len(), 4);
+        let mut rows: Vec<usize> = results
+            .iter()
+            .map(|r| r.as_ref().unwrap().data.num_rows())
+            .collect();
+        rows.sort();
+        assert_eq!(rows, vec![1, 3, 3, 3]);
+        assert_eq!(rows.iter().sum::<usize>(), 10);
+    }
+
+    #[test]
+    fn passthrough_no_accumulation() {
+        // 3 batches of 1 row each -> 3 outputs (no merging).
+        let mut graph = PipelineGraph::new();
+        graph
+            .add_linear(vec![
+                TaskDef::passthrough("middle", |b| Ok(b)),
+            ])
+            .unwrap();
+
+        let mut executor = LocalExecutor::new().with_max_batches(3);
+        let mut source = DefaultGenerator::new();
+        let results: Vec<_> = executor.run(&graph, &mut source).unwrap().collect();
+
+        assert_eq!(results.len(), 3);
+        for result in &results {
+            assert_eq!(result.as_ref().unwrap().data.num_rows(), 1);
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "MaxRows(0) is invalid")]
+    fn max_rows_zero_rejected_batch_size() {
+        TaskDef::passthrough("bad", |b| Ok(b)).with_batch_size(0);
+    }
+
+    #[test]
+    #[should_panic(expected = "MaxRows(0) is invalid")]
+    fn max_rows_zero_rejected_batch_mode() {
+        use crate::task::BatchMode;
+        TaskDef::passthrough("bad", |b| Ok(b)).with_batch_mode(BatchMode::MaxRows(0));
     }
 }
