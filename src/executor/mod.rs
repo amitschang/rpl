@@ -1,4 +1,5 @@
 pub mod local;
+pub mod scheduler;
 
 use std::sync::Arc;
 

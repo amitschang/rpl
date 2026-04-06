@@ -37,6 +37,26 @@ pub struct Resources {
     pub custom: HashMap<String, u32>,
 }
 
+/// Controls how incoming batches are accumulated before a task executes.
+#[derive(Debug, Clone)]
+pub enum BatchMode {
+    /// Accumulate incoming batches until total rows >= N, then concatenate
+    /// and execute. `MaxRows(1)` means process each batch individually
+    /// (the default). A single batch exceeding N rows passes through as-is.
+    MaxRows(usize),
+
+    /// Collect contributions from ALL predecessor branches covering the same
+    /// origin set before executing. Used at merge points in the DAG where
+    /// you need the full picture from every upstream path.
+    CommonOrigin,
+}
+
+impl Default for BatchMode {
+    fn default() -> Self {
+        BatchMode::MaxRows(1)
+    }
+}
+
 /// A task definition within a pipeline graph.
 ///
 /// Each task declares its schema contract:
@@ -53,7 +73,7 @@ pub struct TaskDef {
     produces: Schema,
     drops: Vec<String>,
     pub resources: Resources,
-    pub batch_size: Option<usize>,
+    pub batch_mode: BatchMode,
 }
 
 impl TaskDef {
@@ -82,7 +102,7 @@ impl TaskDef {
             produces,
             drops: Vec::new(),
             resources: Resources { num_cpus: 1, ..Default::default() },
-            batch_size: None,
+            batch_mode: BatchMode::default(),
         }
     }
 
@@ -118,7 +138,7 @@ impl TaskDef {
             produces,
             drops: Vec::new(),
             resources: Resources { num_cpus: 1, ..Default::default() },
-            batch_size: None,
+            batch_mode: BatchMode::default(),
         }
     }
 
@@ -139,9 +159,15 @@ impl TaskDef {
         self
     }
 
-    /// Set batch size.
+    /// Set batch mode.
+    pub fn with_batch_mode(mut self, batch_mode: BatchMode) -> Self {
+        self.batch_mode = batch_mode;
+        self
+    }
+
+    /// Set batch size (sugar for `BatchMode::MaxRows(n)`).
     pub fn with_batch_size(mut self, batch_size: usize) -> Self {
-        self.batch_size = Some(batch_size);
+        self.batch_mode = BatchMode::MaxRows(batch_size);
         self
     }
 
@@ -171,7 +197,7 @@ impl std::fmt::Debug for TaskDef {
         f.debug_struct("TaskDef")
             .field("name", &self.name)
             .field("resources", &self.resources)
-            .field("batch_size", &self.batch_size)
+            .field("batch_mode", &self.batch_mode)
             .finish()
     }
 }

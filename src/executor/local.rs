@@ -1,12 +1,11 @@
-use std::collections::{HashMap, VecDeque};
-
-use arrow::record_batch::RecordBatch;
+use std::collections::VecDeque;
 
 use crate::error::Result;
+use crate::executor::scheduler::BatchScheduler;
 use crate::executor::{Executor, OutputBatch, SourceGenerator};
-use crate::graph::{Node, PipelineGraph};
-
-use petgraph::graph::NodeIndex;
+use crate::graph::PipelineGraph;
+use crate::transport::DataTransport;
+use crate::transport::memory::InMemoryTransport;
 
 /// Serial, single-threaded executor for testing and development.
 ///
@@ -45,19 +44,12 @@ impl Executor for LocalExecutor {
     ) -> Result<Box<dyn Iterator<Item = Result<OutputBatch>> + 'a>> {
         graph.validate(source)?;
 
-        let ranked_order = graph.ranked_nodes();
-        let source_indices = graph.source_tasks();
-
-        let mut queues: HashMap<NodeIndex, VecDeque<RecordBatch>> = HashMap::new();
-        for node in &ranked_order {
-            queues.insert(node.index, VecDeque::new());
-        }
+        let transport = InMemoryTransport::new();
+        let scheduler = BatchScheduler::new(graph, transport);
 
         Ok(Box::new(LocalIter {
             graph,
-            ranked_order,
-            source_indices,
-            queues,
+            scheduler,
             source,
             max_batches: self.max_batches,
             batch_count: 0,
@@ -73,9 +65,7 @@ impl Executor for LocalExecutor {
 /// or the pipeline is exhausted.
 struct LocalIter<'a> {
     graph: &'a PipelineGraph,
-    ranked_order: Vec<Node<'a>>,
-    source_indices: Vec<NodeIndex>,
-    queues: HashMap<NodeIndex, VecDeque<RecordBatch>>,
+    scheduler: BatchScheduler<InMemoryTransport>,
     source: &'a mut dyn SourceGenerator,
     max_batches: Option<usize>,
     batch_count: usize,
@@ -95,34 +85,37 @@ impl<'a> LocalIter<'a> {
             return false;
         }
 
-        // Feed source tasks only when their queues are empty.
-        let sources_idle = self.source_indices
-            .iter()
-            .all(|idx| self.queues[idx].is_empty());
+        // Feed source tasks when under limit.
         let under_limit = match self.max_batches {
             Some(limit) => self.batch_count < limit,
             None => true,
         };
-        if sources_idle && under_limit && let Some(batch) = self.source.next_batch()
-        {
-            for idx in &self.source_indices {
-                self.queues.get_mut(idx).unwrap().push_back(batch.clone());
+        if under_limit {
+            if let Some(batch) = self.source.next_batch() {
+                if let Err(e) = self.scheduler.enqueue_source_batch(&batch) {
+                    self.pending_outputs.push_back(Err(e));
+                    self.done = true;
+                    return true;
+                }
+                self.batch_count += 1;
+            } else {
+                // Source exhausted — enable flush mode for partial MaxRows drain.
+                self.scheduler.mark_flush();
             }
-            self.batch_count += 1;
+        } else {
+            // Max batches reached — flush any partial accumulations.
+            self.scheduler.mark_flush();
         }
 
-        // Process tasks in priority order (closest to sink first).
+        // Process tasks via scheduler until no more are ready.
         let mut did_work = false;
 
-        for node in &self.ranked_order {
-            let queue = self.queues.get_mut(&node.index).unwrap();
-            if queue.is_empty() {
-                continue;
-            }
+        while let Some(ready) = self.scheduler.next_ready_task() {
+            let node_idx = ready.node;
+            let origins = ready.origins;
 
-            let input = queue.pop_front().unwrap();
-
-            let output = match node.execute(input) {
+            // Load and concatenate input batches.
+            let input = match self.scheduler.load_and_concat(&ready.handles) {
                 Ok(batch) => batch,
                 Err(e) => {
                     self.pending_outputs.push_back(Err(e));
@@ -131,17 +124,46 @@ impl<'a> LocalIter<'a> {
                 }
             };
 
-            if node.is_sink {
+            // Release input handles.
+            if let Err(e) = self.scheduler.release_handles(&ready.handles) {
+                self.pending_outputs.push_back(Err(e));
+                self.done = true;
+                return true;
+            }
+
+            // Execute the task.
+            let task = self.graph.task(node_idx);
+            let output = match task.execute(input) {
+                Ok(batch) => batch,
+                Err(e) => {
+                    self.pending_outputs.push_back(Err(e));
+                    self.done = true;
+                    return true;
+                }
+            };
+
+            let num_rows = output.num_rows();
+            let is_sink = self.graph.is_sink(node_idx);
+
+            if is_sink {
                 self.pending_outputs.push_back(Ok(OutputBatch {
                     data: output,
-                    task: node.name.clone(),
+                    task: task.name.clone(),
                 }));
             } else {
-                for successor in &self.graph.successors(node.index) {
-                    self.queues
-                        .get_mut(successor)
-                        .unwrap()
-                        .push_back(output.clone());
+                // Store output and route to successors.
+                let handle = match self.scheduler.transport().store(&output) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        self.pending_outputs.push_back(Err(e));
+                        self.done = true;
+                        return true;
+                    }
+                };
+                if let Err(e) = self.scheduler.deliver_output(node_idx, handle, origins, num_rows) {
+                    self.pending_outputs.push_back(Err(e));
+                    self.done = true;
+                    return true;
                 }
             }
 
@@ -187,6 +209,7 @@ mod tests {
     use crate::task::TaskDef;
     use arrow::array::{Float64Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
 
     fn schema(fields: &[(&str, DataType)]) -> Schema {
@@ -349,5 +372,91 @@ mod tests {
         let batch = &results[0].as_ref().unwrap().data;
         let scaled = batch.column_as::<Float64Array>("scaled").unwrap();
         assert_eq!(scaled.value(0), 0.0); // id=0, factor=10.0 => 0.0
+    }
+
+    #[test]
+    fn max_rows_accumulation() {
+        // source -> accumulate(MaxRows(3)) -> sink
+        // 5 source batches of 1 row each -> expect 2 sink outputs: 3 rows, then 2 rows.
+        let mut graph = PipelineGraph::new();
+        graph
+            .add_linear(vec![
+                TaskDef::passthrough("source", |b| Ok(b)),
+                TaskDef::passthrough("accumulate", |b| Ok(b)).with_batch_size(3),
+                TaskDef::passthrough("sink", |b| Ok(b)),
+            ])
+            .unwrap();
+
+        let mut executor = LocalExecutor::new().with_max_batches(5);
+        let mut source = DefaultGenerator::new();
+        let results: Vec<_> = executor
+            .run(&graph, &mut source)
+            .unwrap()
+            .collect::<Vec<_>>();
+
+        // Should get 2 outputs: one with 3 rows and one with 2 rows.
+        assert_eq!(results.len(), 2);
+        let rows: Vec<usize> = results
+            .iter()
+            .map(|r| r.as_ref().unwrap().data.num_rows())
+            .collect();
+        assert!(rows.contains(&3));
+        assert!(rows.contains(&2));
+        assert_eq!(rows.iter().sum::<usize>(), 5);
+    }
+
+    #[test]
+    fn common_origin_diamond() {
+        use crate::task::BatchMode;
+
+        // A -> B -> D(CommonOrigin)
+        // A -> C -> D
+        // D should receive one merged output per source batch (from both B and C).
+        let mut graph = PipelineGraph::new();
+        let a = graph.add_task(TaskDef::passthrough("source", |b| Ok(b)));
+        let b = graph.add_task(TaskDef::new(
+            "branch_b",
+            Schema::empty(),
+            schema(&[("from_b", DataType::Float64)]),
+            |batch| {
+                let len = batch.num_rows();
+                batch.append_column("from_b", Arc::new(Float64Array::from(vec![1.0; len])))
+            },
+        ));
+        let c = graph.add_task(TaskDef::new(
+            "branch_c",
+            Schema::empty(),
+            schema(&[("from_c", DataType::Float64)]),
+            |batch| {
+                let len = batch.num_rows();
+                batch.append_column("from_c", Arc::new(Float64Array::from(vec![2.0; len])))
+            },
+        ));
+        let d = graph.add_task(
+            TaskDef::passthrough("merge", |b| Ok(b))
+                .with_batch_mode(BatchMode::CommonOrigin),
+        );
+        graph.add_edge(a, b).unwrap();
+        graph.add_edge(a, c).unwrap();
+        graph.add_edge(b, d).unwrap();
+        graph.add_edge(c, d).unwrap();
+
+        let mut executor = LocalExecutor::new().with_max_batches(2);
+        let mut source = DefaultGenerator::new();
+        let results: Vec<_> = executor.run(&graph, &mut source).unwrap().collect();
+
+        // With CommonOrigin, D fires once per origin, merging B and C outputs.
+        // 2 source batches -> 2 merge outputs.
+        assert_eq!(results.len(), 2);
+        for result in &results {
+            let batch = &result.as_ref().unwrap().data;
+            // Each merged batch should have 2 rows (one from B, one from C),
+            // and 2 columns (id is common, from_b + from_c would only appear
+            // if schema intersection includes them — actually since B produces
+            // {id, from_b} and C produces {id, from_c}, intersection is just {id}).
+            // The merge concatenates the batches, so it has 2 rows with just id.
+            assert_eq!(batch.num_rows(), 2);
+            assert_eq!(result.as_ref().unwrap().task, "merge");
+        }
     }
 }

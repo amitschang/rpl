@@ -8,7 +8,7 @@ pub mod executor;
 
 pub use batch_ext::RecordBatchExt;
 pub use error::{Result, RplError};
-pub use task::{TaskDef, Resources};
+pub use task::{TaskDef, Resources, BatchMode};
 pub use graph::{PipelineGraph, Node};
 pub use executor::{Executor, OutputBatch, SourceGenerator, DefaultGenerator};
 pub use transport::DataTransport;
