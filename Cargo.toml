@@ -1,0 +1,13 @@
+[package]
+name = "rpl"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+arrow = { version = "58", features = ["ipc"] }
+petgraph = "0.7"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v4"] }
+tempfile = "3"
