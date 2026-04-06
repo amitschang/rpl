@@ -265,12 +265,15 @@ impl<T: DataTransport> BatchScheduler<T> {
 
     /// Check if a CommonOrigin node is ready to fire.
     ///
+    /// Scans all pending origins across predecessor queues and fires the
+    /// first complete group — not necessarily the oldest. This avoids
+    /// head-of-line blocking in distributed executors where completion
+    /// order is non-deterministic.
+    ///
     /// Algorithm:
-    /// 1. Find the smallest origin ID `k` across all predecessor queues.
-    /// 2. For each predecessor, find the first batch whose origins contain `k`.
-    /// 3. Compute the union of all matched batches' origin sets.
-    /// 4. Verify that every origin in the union is covered by every predecessor.
-    /// 5. If so, pop matched batches and return them.
+    /// 1. Collect all candidate origin IDs from all predecessor queues.
+    /// 2. For each candidate, attempt to build a complete group.
+    /// 3. Return the first complete group found.
     fn check_common_origin(&mut self, node: NodeIndex) -> Option<ReadyTask<T::Handle>> {
         let pred_queues = self.origin_queues.get(&node)?;
 
@@ -279,37 +282,56 @@ impl<T: DataTransport> BatchScheduler<T> {
             return None;
         }
 
-        // Step 1: Find smallest origin across all predecessor queues.
-        let min_origin = pred_queues
-            .values()
-            .filter_map(|q| q.front())
-            .filter_map(|t| t.origins.iter().next().copied())
-            .min()?;
+        // Collect all distinct origin IDs present in any predecessor queue.
+        let mut candidate_origins: BTreeSet<u64> = BTreeSet::new();
+        for queue in pred_queues.values() {
+            for tagged in queue.iter() {
+                candidate_origins.extend(tagged.origins.iter().copied());
+            }
+        }
 
-        // Step 2+3: For each predecessor, find the batch containing min_origin
-        // and build the union of origin sets.
+        // Try each candidate origin — return the first complete group.
+        for &candidate in &candidate_origins {
+            if let Some(ready) = self.try_match_origin(node, candidate) {
+                return Some(ready);
+            }
+        }
+
+        None
+    }
+
+    /// Attempt to build a complete origin group starting from `seed_origin`.
+    ///
+    /// Returns Some(ReadyTask) if every predecessor covers every origin
+    /// in the expanded group, None otherwise.
+    fn try_match_origin(
+        &mut self,
+        node: NodeIndex,
+        seed_origin: u64,
+    ) -> Option<ReadyTask<T::Handle>> {
+        let pred_queues = self.origin_queues.get(&node)?;
+
+        // Step 1: For each predecessor, find the first batch containing seed_origin.
         let mut group_origins = BTreeSet::new();
         let mut match_indices: HashMap<NodeIndex, Vec<usize>> = HashMap::new();
 
         for (&pred, queue) in pred_queues {
-            // Collect all batches from this predecessor whose origins overlap
-            // with the group. Start with min_origin, then expand.
             let mut pred_indices = Vec::new();
             for (i, tagged) in queue.iter().enumerate() {
-                if tagged.origins.contains(&min_origin) {
+                if tagged.origins.contains(&seed_origin) {
                     group_origins.extend(tagged.origins.iter().copied());
                     pred_indices.push(i);
                     break; // Take first match per predecessor.
                 }
             }
             if pred_indices.is_empty() {
-                return None; // This predecessor doesn't have min_origin yet.
+                return None; // This predecessor doesn't have seed_origin yet.
             }
             match_indices.insert(pred, pred_indices);
         }
 
-        // Step 4: Expand — check that every origin in group_origins is covered
-        // by every predecessor. Iterate until stable.
+        // Step 2: Expand — pull in additional batches whose origins overlap
+        // with the group until stable.
         loop {
             let mut expanded = false;
             for (&pred, queue) in pred_queues {
@@ -318,7 +340,6 @@ impl<T: DataTransport> BatchScheduler<T> {
                     if indices.contains(&i) {
                         continue;
                     }
-                    // Does this batch contain any origin in our group?
                     if tagged.origins.iter().any(|o| group_origins.contains(o)) {
                         group_origins.extend(tagged.origins.iter().copied());
                         indices.push(i);
@@ -331,7 +352,8 @@ impl<T: DataTransport> BatchScheduler<T> {
             }
         }
 
-        // Verify full coverage: every predecessor must cover every origin in the group.
+        // Step 3: Verify full coverage — every predecessor must cover every
+        // origin in the group.
         for (&pred, queue) in pred_queues {
             let indices = &match_indices[&pred];
             let covered: BTreeSet<u64> = indices
@@ -339,17 +361,17 @@ impl<T: DataTransport> BatchScheduler<T> {
                 .flat_map(|&i| queue[i].origins.iter().copied())
                 .collect();
             if !group_origins.is_subset(&covered) {
-                return None; // Not all origins are covered yet by this predecessor.
+                return None;
             }
         }
 
-        // Step 5: Pop matched batches (in reverse index order to avoid shifting).
+        // Step 4: Pop matched batches (in reverse index order to avoid shifting).
         let pred_queues = self.origin_queues.get_mut(&node).unwrap();
         let mut all_handles = Vec::new();
 
         for (pred, indices) in &mut match_indices {
             indices.sort_unstable();
-            indices.reverse(); // Pop from back to front.
+            indices.reverse();
             let queue = pred_queues.get_mut(pred).unwrap();
             for &i in indices.iter() {
                 let tagged = queue.remove(i).unwrap();
@@ -764,5 +786,104 @@ mod tests {
             }
         }
         assert!(processed_e, "E should have fired with 3 predecessor contributions");
+    }
+
+    #[test]
+    fn common_origin_out_of_order_completion() {
+        // A -> B -> D(CommonOrigin)
+        // A -> C -> D
+        //
+        // Simulate distributed scenario: origin 1 completes on both branches
+        // before origin 0's B-branch delivers. D should fire origin 1 first,
+        // not block on origin 0.
+        let mut graph = PipelineGraph::new();
+        let a = graph.add_task(TaskDef::passthrough("A", |b| Ok(b)));
+        let b = graph.add_task(TaskDef::passthrough("B", |b| Ok(b)));
+        let c = graph.add_task(TaskDef::passthrough("C", |b| Ok(b)));
+        let d = graph.add_task(
+            TaskDef::passthrough("D", |b| Ok(b)).with_batch_mode(BatchMode::CommonOrigin),
+        );
+        graph.add_edge(a, b).unwrap();
+        graph.add_edge(a, c).unwrap();
+        graph.add_edge(b, d).unwrap();
+        graph.add_edge(c, d).unwrap();
+        graph.validate(&DefaultGenerator::new()).unwrap();
+
+        let transport = InMemoryTransport::new();
+        let mut sched = BatchScheduler::new(&graph, transport);
+
+        // Enqueue 2 source batches (origins 0 and 1).
+        sched.enqueue_source_batch(&make_batch(0)).unwrap();
+        sched.enqueue_source_batch(&make_batch(1)).unwrap();
+
+        // Process all non-D tasks (A, B, C) and collect B/C outputs by origin.
+        let mut b_outputs: Vec<(RecordBatch, BTreeSet<u64>)> = Vec::new();
+        let mut c_outputs: Vec<(RecordBatch, BTreeSet<u64>)> = Vec::new();
+
+        loop {
+            match sched.next_ready_task() {
+                Some(ready) if ready.node == d => {
+                    // D shouldn't be ready yet — but if it is, something is wrong.
+                    panic!("D fired before we expected it to");
+                }
+                Some(ready) => {
+                    let batch = sched.load_and_concat(&ready.handles).unwrap();
+                    let origins = ready.origins.clone();
+                    sched.release_handles(&ready.handles).unwrap();
+
+                    if ready.node == b {
+                        b_outputs.push((batch, origins));
+                    } else if ready.node == c {
+                        c_outputs.push((batch, origins));
+                    } else {
+                        // A (source) — deliver normally so B/C get input.
+                        let handle = sched.transport().store(&batch).unwrap();
+                        sched
+                            .deliver_output(ready.node, handle, origins, batch.num_rows())
+                            .unwrap();
+                    }
+                }
+                None => break,
+            }
+        }
+
+        assert_eq!(b_outputs.len(), 2);
+        assert_eq!(c_outputs.len(), 2);
+
+        // Deliver to D in this order: C(0), C(1), B(1) — withholding B(0).
+        for (batch, origins) in &c_outputs {
+            let handle = sched.transport().store(batch).unwrap();
+            sched.deliver_output(c, handle, origins.clone(), batch.num_rows()).unwrap();
+        }
+        let b1_idx = b_outputs.iter().position(|(_, o)| o.contains(&1)).unwrap();
+        let (ref batch, ref origins) = b_outputs[b1_idx];
+        let handle = sched.transport().store(batch).unwrap();
+        sched.deliver_output(b, handle, origins.clone(), batch.num_rows()).unwrap();
+
+        // D should fire for origin 1 (both B(1) and C(1) delivered),
+        // even though origin 0's B-branch hasn't delivered yet.
+        let ready = sched.next_ready_task().unwrap();
+        assert_eq!(ready.node, d);
+        assert!(
+            ready.origins.contains(&1),
+            "D should fire for origin 1 first, got origins {:?}",
+            ready.origins
+        );
+        assert!(
+            !ready.origins.contains(&0),
+            "D should NOT include origin 0 (B(0) not delivered yet), got {:?}",
+            ready.origins
+        );
+
+        // Now deliver B(0).
+        let b0_idx = 1 - b1_idx;
+        let (ref batch, ref origins) = b_outputs[b0_idx];
+        let handle = sched.transport().store(batch).unwrap();
+        sched.deliver_output(b, handle, origins.clone(), batch.num_rows()).unwrap();
+
+        // D should now fire for origin 0.
+        let ready = sched.next_ready_task().unwrap();
+        assert_eq!(ready.node, d);
+        assert_eq!(ready.origins, BTreeSet::from([0]));
     }
 }
