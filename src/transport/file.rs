@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::{Result, RplError};
-use crate::transport::DataTransport;
+use crate::transport::{DataTransport, OutputEntry};
 
 /// Handle for file-based transport: just a path to an Arrow IPC file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -21,6 +21,10 @@ impl FileHandle {
         &self.0
     }
 }
+
+/// Output token for file-based transport: path to a manifest JSON file.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileOutputToken(PathBuf);
 
 /// File-based transport that writes RecordBatches as Arrow IPC files.
 ///
@@ -50,6 +54,7 @@ impl FileTransport {
 
 impl DataTransport for FileTransport {
     type Handle = FileHandle;
+    type OutputToken = FileOutputToken;
 
     fn store(&self, batch: &RecordBatch) -> Result<Self::Handle> {
         let filename = format!("{}.arrow", Uuid::new_v4());
@@ -96,6 +101,40 @@ impl DataTransport for FileTransport {
             *count += additional;
         }
         Ok(())
+    }
+
+    fn prepare_output(&self) -> Result<Self::OutputToken> {
+        let path = self
+            .staging_dir
+            .join(format!("manifest-{}.json", Uuid::new_v4()));
+        Ok(FileOutputToken(path))
+    }
+
+    fn publish_output(
+        &self,
+        token: &Self::OutputToken,
+        entries: &[OutputEntry<Self::Handle>],
+    ) -> Result<()> {
+        let json = serde_json::to_string(entries)
+            .map_err(|e| RplError::Hq(format!("failed to serialize output entries: {e}")))?;
+        fs::write(&token.0, json)?;
+        Ok(())
+    }
+
+    fn collect_output(
+        &self,
+        token: &Self::OutputToken,
+    ) -> Result<Vec<OutputEntry<Self::Handle>>> {
+        let json = fs::read_to_string(&token.0).map_err(|e| {
+            RplError::Hq(format!(
+                "failed to read manifest {}: {e}",
+                token.0.display()
+            ))
+        })?;
+        let entries: Vec<OutputEntry<Self::Handle>> = serde_json::from_str(&json)
+            .map_err(|e| RplError::Hq(format!("failed to parse manifest: {e}")))?;
+        let _ = fs::remove_file(&token.0);
+        Ok(entries)
     }
 }
 

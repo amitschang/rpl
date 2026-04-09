@@ -5,11 +5,15 @@ use arrow::record_batch::RecordBatch;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, RplError};
-use crate::transport::DataTransport;
+use crate::transport::{DataTransport, OutputEntry};
 
 /// A handle into the in-memory store, identified by a monotonic u64 key.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
 pub struct MemoryHandle(u64);
+
+/// Output token for in-memory transport.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MemoryOutputToken(u64);
 
 struct Entry {
     batch: RecordBatch,
@@ -23,6 +27,7 @@ struct Entry {
 /// process-local.
 pub struct InMemoryTransport {
     store: Mutex<HashMap<u64, Entry>>,
+    output_store: Mutex<HashMap<u64, Vec<OutputEntry<MemoryHandle>>>>,
     next_id: Mutex<u64>,
 }
 
@@ -30,8 +35,16 @@ impl InMemoryTransport {
     pub fn new() -> Self {
         InMemoryTransport {
             store: Mutex::new(HashMap::new()),
+            output_store: Mutex::new(HashMap::new()),
             next_id: Mutex::new(0),
         }
+    }
+
+    fn next_id(&self) -> u64 {
+        let mut next = self.next_id.lock().unwrap();
+        let id = *next;
+        *next += 1;
+        id
     }
 }
 
@@ -43,11 +56,10 @@ impl Default for InMemoryTransport {
 
 impl DataTransport for InMemoryTransport {
     type Handle = MemoryHandle;
+    type OutputToken = MemoryOutputToken;
 
     fn store(&self, batch: &RecordBatch) -> Result<Self::Handle> {
-        let mut next = self.next_id.lock().unwrap();
-        let id = *next;
-        *next += 1;
+        let id = self.next_id();
 
         let mut store = self.store.lock().unwrap();
         store.insert(id, Entry { batch: batch.clone(), ref_count: 1 });
@@ -79,6 +91,30 @@ impl DataTransport for InMemoryTransport {
             entry.ref_count += additional;
         }
         Ok(())
+    }
+
+    fn prepare_output(&self) -> Result<Self::OutputToken> {
+        Ok(MemoryOutputToken(self.next_id()))
+    }
+
+    fn publish_output(
+        &self,
+        token: &Self::OutputToken,
+        entries: &[OutputEntry<Self::Handle>],
+    ) -> Result<()> {
+        let mut store = self.output_store.lock().unwrap();
+        store.insert(token.0, entries.to_vec());
+        Ok(())
+    }
+
+    fn collect_output(
+        &self,
+        token: &Self::OutputToken,
+    ) -> Result<Vec<OutputEntry<Self::Handle>>> {
+        let mut store = self.output_store.lock().unwrap();
+        store.remove(&token.0).ok_or_else(|| {
+            RplError::Transport(format!("output token {:?} not found", token))
+        })
     }
 }
 

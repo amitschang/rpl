@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use arrow::datatypes::Schema;
 use arrow::record_batch::RecordBatch;
@@ -58,6 +59,16 @@ pub enum BatchMode {
     CommonOrigin,
 }
 
+impl BatchMode {
+    /// Return the max rows value if this is `MaxRows(n)`, otherwise `None`.
+    pub fn max_rows(&self) -> Option<usize> {
+        match self {
+            BatchMode::MaxRows(n) => Some(*n),
+            _ => None,
+        }
+    }
+}
+
 /// A task definition within a pipeline graph.
 ///
 /// Each task declares its schema contract:
@@ -67,13 +78,15 @@ pub enum BatchMode {
 ///
 /// These are always required and used by [`PipelineGraph::validate`] to
 /// verify that column dependencies are satisfied across the DAG.
+#[derive(Clone)]
 pub struct TaskDef {
     pub name: String,
-    node: Box<dyn TaskNode>,
+    node: Arc<dyn TaskNode>,
     requires: Schema,
     produces: Schema,
     drops: Vec<String>,
     pub resources: Resources,
+
     pub batch_mode: BatchMode,
 }
 
@@ -95,7 +108,7 @@ impl TaskDef {
     {
         TaskDef {
             name: name.into(),
-            node: Box::new(TaskNodeImpl {
+            node: Arc::new(TaskNodeImpl {
                 func: Box::new(move |batch, _: &()| func(batch)),
                 config: (),
             }),
@@ -131,7 +144,7 @@ impl TaskDef {
     {
         TaskDef {
             name: name.into(),
-            node: Box::new(TaskNodeImpl {
+            node: Arc::new(TaskNodeImpl {
                 func: Box::new(func),
                 config,
             }),

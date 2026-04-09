@@ -455,6 +455,33 @@ impl<T: DataTransport> BatchScheduler<T> {
         Ok(())
     }
 
+    /// Route a task's output to a single specific successor.
+    ///
+    /// Unlike [`deliver_output`](Self::deliver_output), this does not handle
+    /// fan-out or ref counting — the caller is responsible for managing
+    /// transport consumers when delivering to multiple successors individually.
+    pub fn deliver_to_successor(
+        &mut self,
+        from: NodeIndex,
+        to: NodeIndex,
+        handle: T::Handle,
+        origins: BTreeSet<u64>,
+        num_rows: usize,
+    ) {
+        let tagged = TaggedHandle {
+            handle,
+            origins,
+            num_rows,
+        };
+        self.enqueue_to_node(to, Some(from), tagged);
+    }
+
+    /// Successor node indices for a given node.
+    pub fn successors_of(&self, node: NodeIndex) -> &[NodeIndex] {
+        // Return slice from the stored Vec.
+        self.successors.get(&node).map(|v| v.as_slice()).unwrap_or(&[])
+    }
+
     /// Route a sink task's output to the pending output buffer.
     pub fn deliver_sink_output(
         &mut self,

@@ -28,6 +28,9 @@ pub enum RplError {
     /// Transport error.
     #[error("transport error: {0}")]
     Transport(String),
+    /// HyperQueue error.
+    #[error("hyperqueue error: {0}")]
+    Hq(String),
 }
 
 pub type Result<T> = std::result::Result<T, RplError>;
