@@ -1,9 +1,10 @@
 use std::collections::VecDeque;
+use std::time::Instant;
 
 use crate::batch_ext::RecordBatchExt;
 use crate::error::Result;
 use crate::executor::scheduler::BatchScheduler;
-use crate::executor::{Executor, OutputBatch, SourceGenerator};
+use crate::executor::{Executor, OutputBatch, PathStep, SourceGenerator, next_exec_id};
 use crate::graph::PipelineGraph;
 use crate::task::BatchMode;
 use crate::transport::DataTransport;
@@ -114,7 +115,7 @@ impl<'a> LocalIter<'a> {
 
         while let Some(ready) = self.scheduler.next_ready_task() {
             let node_idx = ready.node;
-            let origins = ready.origins;
+            let lineage = ready.lineage;
 
             // Load and concatenate input batches.
             let input = match self.scheduler.load_and_concat(&ready.handles) {
@@ -142,7 +143,8 @@ impl<'a> LocalIter<'a> {
             };
 
             for input_chunk in input_chunks {
-                // Execute the task on each chunk.
+                // Execute the task on each chunk, measuring time.
+                let started = Instant::now();
                 let output = match task.execute(input_chunk) {
                     Ok(batch) => batch,
                     Err(e) => {
@@ -151,6 +153,16 @@ impl<'a> LocalIter<'a> {
                         return true;
                     }
                 };
+                let exec_duration = started.elapsed();
+
+                let step = PathStep {
+                    exec_id: next_exec_id(),
+                    task: task.name.clone(),
+                    exec_duration,
+                    wall_duration: exec_duration,
+                };
+                let mut new_lineage = lineage.clone();
+                new_lineage.path.push(step);
 
                 let num_rows = output.num_rows();
                 let is_sink = self.graph.is_sink(node_idx);
@@ -159,6 +171,7 @@ impl<'a> LocalIter<'a> {
                     self.pending_outputs.push_back(Ok(OutputBatch {
                         data: output,
                         task: task.name.clone(),
+                        lineage: new_lineage,
                     }));
                 } else {
                     let handle = match self.scheduler.transport().store(&output) {
@@ -172,7 +185,7 @@ impl<'a> LocalIter<'a> {
                     if let Err(e) = self.scheduler.deliver_output(
                         node_idx,
                         handle,
-                        origins.clone(),
+                        new_lineage,
                         num_rows,
                     ) {
                         self.pending_outputs.push_back(Err(e));

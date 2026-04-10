@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::time::Instant;
 
 use serde::de::DeserializeOwned;
 
@@ -13,8 +14,8 @@ use crate::registry::TaskRegistry;
 /// is present in argv), execute the task and exit. Returns `false` if this
 /// is not a worker invocation and the caller should continue as the driver.
 ///
-/// This convenience version uses [`FileTransport`] with `--output-dir`
-/// from the command line. For other transports, use
+/// This convenience version uses [`FileTransport`], deriving the staging
+/// directory from the `--output-token` path. For other transports, use
 /// [`run_worker_if_invoked_with`].
 ///
 /// On success, publishes output via the transport and returns `true`.
@@ -25,14 +26,23 @@ pub fn run_worker_if_invoked(registry: &TaskRegistry) -> bool {
         return false;
     }
 
-    // Parse --output-dir to construct FileTransport for the convenience path.
+    // Derive the staging directory from the output token, which is an
+    // absolute path like "<staging_dir>/manifest-<uuid>.json".
     let output_dir = args.windows(2).find_map(|w| {
-        if w[0] == "--output-dir" { Some(&w[1]) } else { None }
+        if w[0] == "--output-token" {
+            let token: std::result::Result<crate::transport::file::FileOutputToken, _> =
+                serde_json::from_str(&w[1]);
+            token.ok().and_then(|t| {
+                t.path().parent().map(|p| p.to_string_lossy().to_string())
+            })
+        } else {
+            None
+        }
     });
     let output_dir = match output_dir {
         Some(d) => d,
         None => {
-            eprintln!("rpl-worker error: missing --output-dir");
+            eprintln!("rpl-worker error: cannot determine staging directory from --output-token");
             std::process::exit(1);
         }
     };
@@ -107,9 +117,11 @@ fn run_execute<T: DataTransport>(
     // Load and concatenate all input batches.
     let input = load_and_concat(&common.input_handles, transport)?;
 
-    // Look up and execute the task.
+    // Look up and execute the task, measuring execution time.
     let task = registry.build(task_name)?;
+    let exec_start = Instant::now();
     let output = task.execute(input)?;
+    let exec_duration_ms = exec_start.elapsed().as_millis() as u64;
 
     // Publish output via the transport.
     let num_rows = output.num_rows();
@@ -120,6 +132,7 @@ fn run_execute<T: DataTransport>(
             handle,
             num_rows,
             origins: common.origins,
+            exec_duration_ms: Some(exec_duration_ms),
         }],
     )
 }
@@ -143,6 +156,7 @@ fn run_split<T: DataTransport>(
                 handle,
                 num_rows: chunk.num_rows(),
                 origins: common.origins.clone(),
+                exec_duration_ms: None,
             })
         })
         .collect::<Result<_>>()?;
@@ -242,10 +256,6 @@ fn parse_worker_args<H: DeserializeOwned, OT: DeserializeOwned>(
                 output_token = Some(serde_json::from_str(json).map_err(|e| {
                     RplError::Hq(format!("invalid --output-token JSON: {e}"))
                 })?);
-            }
-            // Legacy: skip --output-dir and --manifest (used by convenience path).
-            "--output-dir" | "--manifest" => {
-                i += 1;
             }
             _ => {}
         }

@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 
 use petgraph::algo::{is_cyclic_directed, toposort};
 use petgraph::graph::{DiGraph, NodeIndex};
@@ -263,6 +264,66 @@ impl PipelineGraph {
     /// Reference to the underlying petgraph.
     pub fn inner(&self) -> &DiGraph<TaskDef, ()> {
         &self.graph
+    }
+
+    /// Print a detailed summary of the graph structure to stdout.
+    ///
+    /// Includes task list with roles, batch modes, resources, edges,
+    /// and sink-rank priority ordering.
+    pub fn print_summary(&self) {
+        let sources = self.source_tasks().len();
+        let sinks = self.sink_tasks().len();
+        println!(
+            "Pipeline: {} tasks ({sources} source, {sinks} sink), {} edges",
+            self.task_count(),
+            self.graph.edge_count(),
+        );
+        println!();
+
+        for node in self.nodes() {
+            let role = match (node.is_source, node.is_sink) {
+                (true, _) => "SOURCE",
+                (_, true) => "SINK  ",
+                _ => "      ",
+            };
+            println!(
+                "  [{role}] {name:<15} batch_mode={mode:?}  resources=(cpus={cpus}, gpus={gpus})",
+                name = node.name,
+                mode = node.batch_mode,
+                cpus = node.resources.num_cpus,
+                gpus = node.resources.num_gpus,
+            );
+        }
+
+        println!();
+        println!("Edges:");
+        for node in self.nodes() {
+            for succ in self.successors(node.index) {
+                println!("  {} -> {}", node.name, self.task(succ).name);
+            }
+        }
+
+        println!();
+        println!("Sink-rank (priority ordering):");
+        let ranks = self.rank_from_sink();
+        let mut ranked: Vec<_> = ranks.iter().collect();
+        ranked.sort_by_key(|(_, r)| **r);
+        for (idx, rank) in ranked {
+            println!("  {:<15} rank={}", self.task(*idx).name, rank);
+        }
+    }
+}
+
+impl fmt::Display for PipelineGraph {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let sources = self.source_tasks().len();
+        let sinks = self.sink_tasks().len();
+        write!(
+            f,
+            "Pipeline({} tasks, {} edges, {sources} source, {sinks} sink)",
+            self.task_count(),
+            self.graph.edge_count(),
+        )
     }
 }
 

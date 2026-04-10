@@ -2,7 +2,9 @@ pub mod hq;
 pub mod local;
 pub mod scheduler;
 
-use std::sync::Arc;
+use std::collections::BTreeSet;
+use std::sync::{Arc, atomic};
+use std::time::Duration;
 
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
@@ -61,11 +63,44 @@ impl SourceGenerator for DefaultGenerator {
     }
 }
 
+/// Global counter for unique execution IDs.
+static NEXT_EXEC_ID: atomic::AtomicU64 =  atomic::AtomicU64::new(0);
+
+/// Allocate a globally unique execution ID for a [`PathStep`].
+pub fn next_exec_id() -> u64 {
+    NEXT_EXEC_ID.fetch_add(1, atomic::Ordering::Relaxed)
+}
+
+/// One step in a batch's journey through the DAG.
+#[derive(Debug, Clone)]
+pub struct PathStep {
+    /// Unique identifier for this particular execution.
+    /// Two output batches that share the same `exec_id` for a step
+    /// went through that step in the same physical execution (e.g. fan-out).
+    pub exec_id: u64,
+    /// Name of the task that processed this batch.
+    pub task: String,
+    /// Pure execution time as measured by the worker.
+    pub exec_duration: Duration,
+    /// Wall time from submit to completion as seen by the driver.
+    pub wall_duration: Duration,
+}
+
+/// Per-batch lineage accumulated as it flows through the pipeline.
+#[derive(Debug, Clone, Default)]
+pub struct BatchLineage {
+    /// Source batch IDs that contributed to this batch.
+    pub origins: BTreeSet<u64>,
+    /// Ordered sequence of tasks this batch passed through.
+    pub path: Vec<PathStep>,
+}
+
 /// A completed output batch from a sink task.
 #[derive(Debug)]
 pub struct OutputBatch {
     pub data: RecordBatch,
     pub task: String,
+    pub lineage: BatchLineage,
 }
 
 /// Trait for pipeline execution backends.

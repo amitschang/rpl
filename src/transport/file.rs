@@ -26,6 +26,12 @@ impl FileHandle {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileOutputToken(PathBuf);
 
+impl FileOutputToken {
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+}
+
 /// File-based transport that writes RecordBatches as Arrow IPC files.
 ///
 /// Suitable for distributed executors where tasks run in separate processes

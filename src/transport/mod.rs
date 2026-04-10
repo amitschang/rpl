@@ -16,6 +16,10 @@ pub struct OutputEntry<H> {
     pub handle: H,
     pub num_rows: usize,
     pub origins: BTreeSet<u64>,
+    /// Task execution time in milliseconds (worker-measured).
+    /// `None` for split-only operations.
+    #[serde(default)]
+    pub exec_duration_ms: Option<u64>,
 }
 
 /// Abstraction for moving RecordBatch data between tasks.

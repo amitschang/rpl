@@ -4,17 +4,17 @@ pub mod worker;
 pub use client::{HqBackend, HqClient};
 pub use worker::{run_worker_if_invoked, run_worker_if_invoked_with};
 
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use petgraph::graph::NodeIndex;
 
 use crate::error::{Result, RplError};
 use crate::executor::scheduler::{BatchScheduler, TaggedHandle};
-use crate::executor::{Executor, OutputBatch, SourceGenerator};
+use crate::executor::{BatchLineage, Executor, OutputBatch, PathStep, SourceGenerator, next_exec_id};
 use crate::graph::PipelineGraph;
 use crate::task::BatchMode;
 use crate::transport::DataTransport;
@@ -42,18 +42,26 @@ pub struct HqExecutor<B = HqClient, T: DataTransport = FileTransport> {
 
 impl HqExecutor<HqClient, FileTransport> {
     /// Create an executor using the real HQ CLI and file-based transport.
+    ///
+    /// Uses `"hq"` from PATH by default; call
+    /// [`with_hq_binary`](Self::with_hq_binary) to override.
     pub fn new(
-        hq_binary: impl Into<PathBuf>,
         staging_dir: impl Into<PathBuf>,
     ) -> Result<Self> {
         let transport = Arc::new(FileTransport::new(staging_dir)?);
         Ok(HqExecutor {
-            client: HqClient::new(hq_binary),
+            client: HqClient::new("hq"),
             transport,
             max_batches: None,
-            poll_interval: Duration::from_millis(100),
+            poll_interval: Duration::from_millis(250),
             source_buffer: 16,
         })
+    }
+
+    /// Override the HQ binary path (default: `"hq"` from PATH).
+    pub fn with_hq_binary(mut self, hq_binary: impl Into<PathBuf>) -> Self {
+        self.client = HqClient::new(hq_binary);
+        self
     }
 }
 
@@ -64,7 +72,7 @@ impl<B: HqBackend, T: DataTransport> HqExecutor<B, T> {
             client: backend,
             transport: Arc::new(transport),
             max_batches: None,
-            poll_interval: Duration::from_millis(100),
+            poll_interval: Duration::from_millis(250),
             source_buffer: 16,
         }
     }
@@ -78,7 +86,7 @@ impl<B: HqBackend, T: DataTransport> HqExecutor<B, T> {
             client: backend,
             transport,
             max_batches: None,
-            poll_interval: Duration::from_millis(100),
+            poll_interval: Duration::from_millis(250),
             source_buffer: 16,
         }
     }
@@ -156,6 +164,8 @@ enum InFlightTask<H, OT> {
         node: NodeIndex,
         input_handles: Vec<TaggedHandle<H>>,
         output_token: OT,
+        submitted_at: Instant,
+        lineage: BatchLineage,
     },
     /// A split-only task targeting a specific successor.
     Split {
@@ -166,11 +176,12 @@ enum InFlightTask<H, OT> {
         /// Handle to the unsplit batch (released after split completes).
         source_handle: H,
         output_token: OT,
+        lineage: BatchLineage,
     },
 }
 
 /// Lazy iterator driving the HQ executor pipeline.
-struct HqIter<'a, B, T: DataTransport> {
+struct HqIter<'a, B: HqBackend, T: DataTransport> {
     graph: &'a PipelineGraph,
     scheduler: BatchScheduler<Arc<T>>,
     source: &'a mut dyn SourceGenerator,
@@ -224,7 +235,7 @@ impl<B: HqBackend, T: DataTransport> HqIter<'_, B, T> {
                 // Drain scheduler after each source batch to submit HQ tasks.
                 while let Some(ready) = self.scheduler.next_ready_task() {
                     if let Err(e) =
-                        self.submit_hq_task(ready.node, ready.handles, ready.origins)
+                        self.submit_hq_task(ready.node, ready.handles, ready.lineage)
                     {
                         self.pending_outputs.push_back(Err(e));
                         self.done = true;
@@ -243,7 +254,7 @@ impl<B: HqBackend, T: DataTransport> HqIter<'_, B, T> {
 
         // 2. Drain any remaining ready tasks.
         while let Some(ready) = self.scheduler.next_ready_task() {
-            if let Err(e) = self.submit_hq_task(ready.node, ready.handles, ready.origins) {
+            if let Err(e) = self.submit_hq_task(ready.node, ready.handles, ready.lineage) {
                 self.pending_outputs.push_back(Err(e));
                 self.done = true;
                 return true;
@@ -270,7 +281,7 @@ impl<B: HqBackend, T: DataTransport> HqIter<'_, B, T> {
         &mut self,
         node: NodeIndex,
         handles: Vec<TaggedHandle<T::Handle>>,
-        origins: BTreeSet<u64>,
+        lineage: BatchLineage,
     ) -> Result<()> {
         let task = self.graph.task(node);
         let priority = self.priorities[&node];
@@ -281,7 +292,7 @@ impl<B: HqBackend, T: DataTransport> HqIter<'_, B, T> {
         )
         .map_err(|e| RplError::Hq(format!("failed to serialize input handles: {e}")))?;
 
-        let origins_json = serde_json::to_string(&origins)
+        let origins_json = serde_json::to_string(&lineage.origins)
             .map_err(|e| RplError::Hq(format!("failed to serialize origins: {e}")))?;
 
         // Prepare an output token for this task.
@@ -318,6 +329,8 @@ impl<B: HqBackend, T: DataTransport> HqIter<'_, B, T> {
                 node,
                 input_handles: handles,
                 output_token,
+                submitted_at: Instant::now(),
+                lineage,
             },
         );
 
@@ -330,7 +343,7 @@ impl<B: HqBackend, T: DataTransport> HqIter<'_, B, T> {
         from: NodeIndex,
         target: NodeIndex,
         handle: T::Handle,
-        origins: &BTreeSet<u64>,
+        lineage: BatchLineage,
         max_rows: usize,
     ) -> Result<()> {
         let priority = self.priorities[&target];
@@ -338,7 +351,7 @@ impl<B: HqBackend, T: DataTransport> HqIter<'_, B, T> {
         let input_handles_json = serde_json::to_string(&vec![&handle])
             .map_err(|e| RplError::Hq(format!("failed to serialize handle: {e}")))?;
 
-        let origins_json = serde_json::to_string(origins)
+        let origins_json = serde_json::to_string(&lineage.origins)
             .map_err(|e| RplError::Hq(format!("failed to serialize origins: {e}")))?;
 
         let output_token = self.scheduler.transport().prepare_output()?;
@@ -372,6 +385,7 @@ impl<B: HqBackend, T: DataTransport> HqIter<'_, B, T> {
                 target,
                 source_handle: handle,
                 output_token,
+                lineage,
             },
         );
 
@@ -382,7 +396,8 @@ impl<B: HqBackend, T: DataTransport> HqIter<'_, B, T> {
         // Sleep briefly to avoid busy-spinning.
         thread::sleep(self.poll_interval);
 
-        let poll_result = self.client.poll_tasks(self.job_id)?;
+        let in_flight_ids: Vec<u64> = self.in_flight.keys().copied().collect();
+        let poll_result = self.client.poll_tasks(self.job_id, &in_flight_ids)?;
 
         let newly_completed: Vec<CompletedTask> = poll_result
             .completed
@@ -410,6 +425,8 @@ impl<B: HqBackend, T: DataTransport> HqIter<'_, B, T> {
                         node,
                         input_handles,
                         output_token,
+                        submitted_at,
+                        lineage,
                     } => {
                         if !completed_task.success {
                             let task_name = &self.graph.task(node).name;
@@ -419,27 +436,47 @@ impl<B: HqBackend, T: DataTransport> HqIter<'_, B, T> {
                             )));
                         }
 
+                        let wall_duration = submitted_at.elapsed();
+
                         // Release input handles.
                         self.scheduler.release_handles(&input_handles)?;
 
                         let entries = self.scheduler.transport().collect_output(&output_token)?;
                         let is_sink = self.graph.is_sink(node);
 
+                        // Build the path step for this task.
+                        let exec_duration = entries
+                            .first()
+                            .and_then(|e| e.exec_duration_ms)
+                            .map(Duration::from_millis)
+                            .unwrap_or_default();
+                        let step = PathStep {
+                            exec_id: next_exec_id(),
+                            task: self.graph.task(node).name.clone(),
+                            exec_duration,
+                            wall_duration,
+                        };
+                        let mut new_lineage = lineage;
+                        new_lineage.path.push(step);
+
                         if is_sink {
                             for entry in entries {
+                                new_lineage.origins = entry.origins;
                                 let data = self.scheduler.transport().load(&entry.handle)?;
                                 self.scheduler.transport().release(&entry.handle)?;
                                 self.pending_outputs.push_back(Ok(OutputBatch {
                                     data,
                                     task: self.graph.task(node).name.clone(),
+                                    lineage: new_lineage.clone(),
                                 }));
                             }
                         } else {
                             for entry in entries {
+                                new_lineage.origins = entry.origins;
                                 self.route_to_successors(
                                     node,
                                     entry.handle,
-                                    entry.origins,
+                                    new_lineage.clone(),
                                     entry.num_rows,
                                 )?;
                             }
@@ -451,6 +488,7 @@ impl<B: HqBackend, T: DataTransport> HqIter<'_, B, T> {
                         target,
                         source_handle,
                         output_token,
+                        lineage,
                     } => {
                         if !completed_task.success {
                             return Err(RplError::Hq(format!(
@@ -465,11 +503,13 @@ impl<B: HqBackend, T: DataTransport> HqIter<'_, B, T> {
                         let entries = self.scheduler.transport().collect_output(&output_token)?;
 
                         for entry in entries {
+                            let mut entry_lineage = lineage.clone();
+                            entry_lineage.origins = entry.origins;
                             self.scheduler.deliver_to_successor(
                                 from,
                                 target,
                                 entry.handle,
-                                entry.origins,
+                                entry_lineage,
                                 entry.num_rows,
                             );
                         }
@@ -486,7 +526,7 @@ impl<B: HqBackend, T: DataTransport> HqIter<'_, B, T> {
         &mut self,
         from: NodeIndex,
         handle: T::Handle,
-        origins: BTreeSet<u64>,
+        lineage: BatchLineage,
         num_rows: usize,
     ) -> Result<()> {
         let succs: Vec<NodeIndex> = self.scheduler.successors_of(from).to_vec();
@@ -511,13 +551,13 @@ impl<B: HqBackend, T: DataTransport> HqIter<'_, B, T> {
 
             if needs_split {
                 let max_rows = self.graph.task(succ).batch_mode.max_rows().unwrap();
-                self.submit_split_task(from, succ, handle.clone(), &origins, max_rows)?;
+                self.submit_split_task(from, succ, handle.clone(), lineage.clone(), max_rows)?;
             } else {
                 self.scheduler.deliver_to_successor(
                     from,
                     succ,
                     handle.clone(),
-                    origins.clone(),
+                    lineage.clone(),
                     num_rows,
                 );
             }
@@ -527,8 +567,16 @@ impl<B: HqBackend, T: DataTransport> HqIter<'_, B, T> {
     }
 
     fn finish(&mut self) {
-        let _ = self.client.close_job(self.job_id);
+        if !self.done {
+            let _ = self.client.close_job(self.job_id);
+        }
         self.done = true;
+    }
+}
+
+impl<B: HqBackend, T: DataTransport> Drop for HqIter<'_, B, T> {
+    fn drop(&mut self) {
+        self.finish();
     }
 }
 
@@ -611,7 +659,7 @@ mod tests {
             Ok(id)
         }
 
-        fn poll_tasks(&self, _job_id: u64) -> crate::error::Result<JobPollResult> {
+        fn poll_tasks(&self, _job_id: u64, _task_ids: &[u64]) -> crate::error::Result<JobPollResult> {
             let pending = self.pending.borrow_mut().drain(..).collect::<Vec<_>>();
             Ok(JobPollResult {
                 completed: pending

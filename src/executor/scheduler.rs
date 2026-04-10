@@ -5,18 +5,20 @@ use arrow::record_batch::RecordBatch;
 use petgraph::graph::NodeIndex;
 
 use crate::error::{Result, RplError};
+use crate::executor::BatchLineage;
 use crate::graph::PipelineGraph;
 use crate::task::BatchMode;
 use crate::transport::DataTransport;
 
-/// A batch reference annotated with origin lineage.
+/// A batch reference annotated with lineage.
 ///
-/// `origins` tracks which source batch IDs contributed to this batch.
-/// When `MaxRows` merges multiple batches, their origin sets are unioned.
+/// `lineage.origins` tracks which source batch IDs contributed to this batch.
+/// `lineage.path` records the sequence of tasks this batch passed through.
+/// When `MaxRows` merges multiple batches, their lineages are merged.
 #[derive(Debug, Clone)]
 pub struct TaggedHandle<H> {
     pub handle: H,
-    pub origins: BTreeSet<u64>,
+    pub lineage: BatchLineage,
     pub num_rows: usize,
 }
 
@@ -24,14 +26,14 @@ pub struct TaggedHandle<H> {
 pub struct ReadyTask<H> {
     pub node: NodeIndex,
     pub handles: Vec<TaggedHandle<H>>,
-    /// Union of all origins across the handles.
-    pub origins: BTreeSet<u64>,
+    /// Merged lineage across all input handles.
+    pub lineage: BatchLineage,
 }
 
 /// Sink output buffered for the executor to drain.
 pub struct SinkOutput<H> {
     pub handle: H,
-    pub origins: BTreeSet<u64>,
+    pub lineage: BatchLineage,
     pub task_name: String,
 }
 
@@ -163,7 +165,10 @@ impl<T: DataTransport> BatchScheduler<T> {
         for &src in &source_indices {
             let tagged = TaggedHandle {
                 handle: handle.clone(),
-                origins: origins.clone(),
+                lineage: BatchLineage {
+                    origins: origins.clone(),
+                    path: Vec::new(),
+                },
                 num_rows,
             };
             self.enqueue_to_node(src, None, tagged);
@@ -232,11 +237,11 @@ impl<T: DataTransport> BatchScheduler<T> {
     fn check_passthrough(&mut self, node: NodeIndex) -> Option<ReadyTask<T::Handle>> {
         let queue = self.queues.get_mut(&node)?;
         let tagged = queue.pop_front()?;
-        let origins = tagged.origins.clone();
+        let lineage = tagged.lineage.clone();
         Some(ReadyTask {
             node,
             handles: vec![tagged],
-            origins,
+            lineage,
         })
     }
 
@@ -265,7 +270,7 @@ impl<T: DataTransport> BatchScheduler<T> {
         let queue = self.queues.get_mut(&node).unwrap();
         let mut handles = Vec::new();
         let mut collected_rows = 0;
-        let mut origins = BTreeSet::new();
+        let mut lineage = BatchLineage::default();
 
         while let Some(front) = queue.front() {
             if !handles.is_empty() && collected_rows + front.num_rows > max_rows {
@@ -273,14 +278,19 @@ impl<T: DataTransport> BatchScheduler<T> {
             }
             let tagged = queue.pop_front().unwrap();
             collected_rows += tagged.num_rows;
-            origins.extend(tagged.origins.iter().copied());
+            lineage.origins.extend(tagged.lineage.origins.iter().copied());
+            // Merge paths: take the longest path as representative when
+            // accumulating multiple batches (they share the same route).
+            if tagged.lineage.path.len() > lineage.path.len() {
+                lineage.path = tagged.lineage.path.clone();
+            }
             handles.push(tagged);
         }
 
         Some(ReadyTask {
             node,
             handles,
-            origins,
+            lineage,
         })
     }
 
@@ -307,7 +317,7 @@ impl<T: DataTransport> BatchScheduler<T> {
         let mut candidate_origins: BTreeSet<u64> = BTreeSet::new();
         for queue in pred_queues.values() {
             for tagged in queue.iter() {
-                candidate_origins.extend(tagged.origins.iter().copied());
+                candidate_origins.extend(tagged.lineage.origins.iter().copied());
             }
         }
 
@@ -339,8 +349,8 @@ impl<T: DataTransport> BatchScheduler<T> {
         for (&pred, queue) in pred_queues {
             let mut pred_indices = Vec::new();
             for (i, tagged) in queue.iter().enumerate() {
-                if tagged.origins.contains(&seed_origin) {
-                    group_origins.extend(tagged.origins.iter().copied());
+                if tagged.lineage.origins.contains(&seed_origin) {
+                    group_origins.extend(tagged.lineage.origins.iter().copied());
                     pred_indices.push(i);
                     break; // Take first match per predecessor.
                 }
@@ -361,8 +371,8 @@ impl<T: DataTransport> BatchScheduler<T> {
                     if indices.contains(&i) {
                         continue;
                     }
-                    if tagged.origins.iter().any(|o| group_origins.contains(o)) {
-                        group_origins.extend(tagged.origins.iter().copied());
+                    if tagged.lineage.origins.iter().any(|o| group_origins.contains(o)) {
+                        group_origins.extend(tagged.lineage.origins.iter().copied());
                         indices.push(i);
                         expanded = true;
                     }
@@ -379,7 +389,7 @@ impl<T: DataTransport> BatchScheduler<T> {
             let indices = &match_indices[&pred];
             let covered: BTreeSet<u64> = indices
                 .iter()
-                .flat_map(|&i| queue[i].origins.iter().copied())
+                .flat_map(|&i| queue[i].lineage.origins.iter().copied())
                 .collect();
             if !group_origins.is_subset(&covered) {
                 return None;
@@ -400,10 +410,21 @@ impl<T: DataTransport> BatchScheduler<T> {
             }
         }
 
+        // Merge lineages from all matched handles.
+        let mut lineage = BatchLineage {
+            origins: group_origins,
+            path: Vec::new(),
+        };
+        for h in &all_handles {
+            if h.lineage.path.len() > lineage.path.len() {
+                lineage.path = h.lineage.path.clone();
+            }
+        }
+
         Some(ReadyTask {
             node,
             handles: all_handles,
-            origins: group_origins,
+            lineage,
         })
     }
 
@@ -415,7 +436,7 @@ impl<T: DataTransport> BatchScheduler<T> {
         &mut self,
         from: NodeIndex,
         handle: T::Handle,
-        origins: BTreeSet<u64>,
+        lineage: BatchLineage,
         num_rows: usize,
     ) -> Result<()> {
         let succs = self.successors[&from].clone();
@@ -425,7 +446,7 @@ impl<T: DataTransport> BatchScheduler<T> {
             let task_name = String::new(); // Filled by caller via deliver_sink_output.
             self.pending_sink.push_back(SinkOutput {
                 handle,
-                origins,
+                lineage,
                 task_name,
             });
             return Ok(());
@@ -446,7 +467,7 @@ impl<T: DataTransport> BatchScheduler<T> {
         for &succ in &succs {
             let tagged = TaggedHandle {
                 handle: handle.clone(),
-                origins: origins.clone(),
+                lineage: lineage.clone(),
                 num_rows,
             };
             self.enqueue_to_node(succ, Some(from), tagged);
@@ -465,12 +486,12 @@ impl<T: DataTransport> BatchScheduler<T> {
         from: NodeIndex,
         to: NodeIndex,
         handle: T::Handle,
-        origins: BTreeSet<u64>,
+        lineage: BatchLineage,
         num_rows: usize,
     ) {
         let tagged = TaggedHandle {
             handle,
-            origins,
+            lineage,
             num_rows,
         };
         self.enqueue_to_node(to, Some(from), tagged);
@@ -486,12 +507,12 @@ impl<T: DataTransport> BatchScheduler<T> {
     pub fn deliver_sink_output(
         &mut self,
         handle: T::Handle,
-        origins: BTreeSet<u64>,
+        lineage: BatchLineage,
         task_name: String,
     ) {
         self.pending_sink.push_back(SinkOutput {
             handle,
-            origins,
+            lineage,
             task_name,
         });
     }
@@ -582,14 +603,14 @@ mod tests {
         let batch = sched.load_and_concat(&ready.handles).unwrap();
         sched.release_handles(&ready.handles).unwrap();
         let handle = sched.transport().store(&batch).unwrap();
-        sched.deliver_output(ready.node, handle, ready.origins, batch.num_rows()).unwrap();
+        sched.deliver_output(ready.node, handle, ready.lineage, batch.num_rows()).unwrap();
 
         // Process second source batch.
         let ready = sched.next_ready_task().unwrap();
         let batch = sched.load_and_concat(&ready.handles).unwrap();
         sched.release_handles(&ready.handles).unwrap();
         let handle = sched.transport().store(&batch).unwrap();
-        sched.deliver_output(ready.node, handle, ready.origins, batch.num_rows()).unwrap();
+        sched.deliver_output(ready.node, handle, ready.lineage, batch.num_rows()).unwrap();
 
         // Accumulate node should NOT be ready yet (2 rows < 3).
         // Next ready should be None (sink has nothing, accumulate not ready).
@@ -601,14 +622,14 @@ mod tests {
         let batch = sched.load_and_concat(&ready.handles).unwrap();
         sched.release_handles(&ready.handles).unwrap();
         let handle = sched.transport().store(&batch).unwrap();
-        sched.deliver_output(ready.node, handle, ready.origins, batch.num_rows()).unwrap();
+        sched.deliver_output(ready.node, handle, ready.lineage, batch.num_rows()).unwrap();
 
         // Now accumulate should be ready with 3 rows.
         let ready = sched.next_ready_task().unwrap();
         assert_eq!(ready.handles.len(), 3);
         let batch = sched.load_and_concat(&ready.handles).unwrap();
         assert_eq!(batch.num_rows(), 3);
-        assert_eq!(ready.origins, BTreeSet::from([0, 1, 2]));
+        assert_eq!(ready.lineage.origins, BTreeSet::from([0, 1, 2]));
     }
 
     #[test]
@@ -633,7 +654,7 @@ mod tests {
             let batch = sched.load_and_concat(&ready.handles).unwrap();
             sched.release_handles(&ready.handles).unwrap();
             let handle = sched.transport().store(&batch).unwrap();
-            sched.deliver_output(ready.node, handle, ready.origins, batch.num_rows()).unwrap();
+            sched.deliver_output(ready.node, handle, ready.lineage, batch.num_rows()).unwrap();
         }
 
         // Accumulate not ready (2 < 5).
@@ -673,7 +694,7 @@ mod tests {
         let batch = sched.load_and_concat(&ready.handles).unwrap();
         sched.release_handles(&ready.handles).unwrap();
         let handle = sched.transport().store(&batch).unwrap();
-        sched.deliver_output(ready.node, handle, ready.origins, batch.num_rows()).unwrap();
+        sched.deliver_output(ready.node, handle, ready.lineage, batch.num_rows()).unwrap();
 
         // D should NOT be ready yet (only one predecessor has delivered).
         // Should get B or C next.
@@ -682,7 +703,7 @@ mod tests {
         let batch = sched.load_and_concat(&ready.handles).unwrap();
         sched.release_handles(&ready.handles).unwrap();
         let handle = sched.transport().store(&batch).unwrap();
-        sched.deliver_output(ready.node, handle, ready.origins, batch.num_rows()).unwrap();
+        sched.deliver_output(ready.node, handle, ready.lineage, batch.num_rows()).unwrap();
 
         // D still not ready (missing one predecessor).
         // Should get the other branch.
@@ -692,13 +713,13 @@ mod tests {
         let batch = sched.load_and_concat(&ready.handles).unwrap();
         sched.release_handles(&ready.handles).unwrap();
         let handle = sched.transport().store(&batch).unwrap();
-        sched.deliver_output(ready.node, handle, ready.origins, batch.num_rows()).unwrap();
+        sched.deliver_output(ready.node, handle, ready.lineage, batch.num_rows()).unwrap();
 
         // Now D should be ready with contributions from both B and C.
         let ready = sched.next_ready_task().unwrap();
         assert_eq!(ready.node, d);
         assert_eq!(ready.handles.len(), 2);
-        assert_eq!(ready.origins, BTreeSet::from([0]));
+        assert_eq!(ready.lineage.origins, BTreeSet::from([0]));
     }
 
     #[test]
@@ -748,7 +769,7 @@ mod tests {
                         let batch = sched.load_and_concat(&r.handles).unwrap();
                         sched.release_handles(&r.handles).unwrap();
                         let handle = sched.transport().store(&batch).unwrap();
-                        sched.deliver_output(r.node, handle, r.origins, batch.num_rows()).unwrap();
+                        sched.deliver_output(r.node, handle, r.lineage, batch.num_rows()).unwrap();
                         return true;
                     }
                     None => break,
@@ -757,7 +778,7 @@ mod tests {
                 sched.release_handles(&ready.handles).unwrap();
                 let handle = sched.transport().store(&batch).unwrap();
                 sched
-                    .deliver_output(ready.node, handle, ready.origins, batch.num_rows())
+                    .deliver_output(ready.node, handle, ready.lineage, batch.num_rows())
                     .unwrap();
                 did_work = true;
             }
@@ -819,7 +840,7 @@ mod tests {
                     if ready.node == e {
                         // E should have 3 handles (one from each predecessor).
                         assert_eq!(ready.handles.len(), 3);
-                        assert_eq!(ready.origins, BTreeSet::from([0]));
+                        assert_eq!(ready.lineage.origins, BTreeSet::from([0]));
                         processed_e = true;
                         break;
                     }
@@ -827,7 +848,7 @@ mod tests {
                     sched.release_handles(&ready.handles).unwrap();
                     let handle = sched.transport().store(&batch).unwrap();
                     sched
-                        .deliver_output(ready.node, handle, ready.origins, batch.num_rows())
+                        .deliver_output(ready.node, handle, ready.lineage, batch.num_rows())
                         .unwrap();
                 }
                 None => break,
@@ -865,8 +886,8 @@ mod tests {
         sched.enqueue_source_batch(&make_batch(1)).unwrap();
 
         // Process all non-D tasks (A, B, C) and collect B/C outputs by origin.
-        let mut b_outputs: Vec<(RecordBatch, BTreeSet<u64>)> = Vec::new();
-        let mut c_outputs: Vec<(RecordBatch, BTreeSet<u64>)> = Vec::new();
+        let mut b_outputs: Vec<(RecordBatch, BatchLineage)> = Vec::new();
+        let mut c_outputs: Vec<(RecordBatch, BatchLineage)> = Vec::new();
 
         loop {
             match sched.next_ready_task() {
@@ -876,18 +897,18 @@ mod tests {
                 }
                 Some(ready) => {
                     let batch = sched.load_and_concat(&ready.handles).unwrap();
-                    let origins = ready.origins.clone();
+                    let lineage = ready.lineage.clone();
                     sched.release_handles(&ready.handles).unwrap();
 
                     if ready.node == b {
-                        b_outputs.push((batch, origins));
+                        b_outputs.push((batch, lineage));
                     } else if ready.node == c {
-                        c_outputs.push((batch, origins));
+                        c_outputs.push((batch, lineage));
                     } else {
                         // A (source) — deliver normally so B/C get input.
                         let handle = sched.transport().store(&batch).unwrap();
                         sched
-                            .deliver_output(ready.node, handle, origins, batch.num_rows())
+                            .deliver_output(ready.node, handle, lineage, batch.num_rows())
                             .unwrap();
                     }
                 }
@@ -899,39 +920,39 @@ mod tests {
         assert_eq!(c_outputs.len(), 2);
 
         // Deliver to D in this order: C(0), C(1), B(1) — withholding B(0).
-        for (batch, origins) in &c_outputs {
+        for (batch, lineage) in &c_outputs {
             let handle = sched.transport().store(batch).unwrap();
-            sched.deliver_output(c, handle, origins.clone(), batch.num_rows()).unwrap();
+            sched.deliver_output(c, handle, lineage.clone(), batch.num_rows()).unwrap();
         }
-        let b1_idx = b_outputs.iter().position(|(_, o)| o.contains(&1)).unwrap();
-        let (ref batch, ref origins) = b_outputs[b1_idx];
+        let b1_idx = b_outputs.iter().position(|(_, l)| l.origins.contains(&1)).unwrap();
+        let (ref batch, ref lineage) = b_outputs[b1_idx];
         let handle = sched.transport().store(batch).unwrap();
-        sched.deliver_output(b, handle, origins.clone(), batch.num_rows()).unwrap();
+        sched.deliver_output(b, handle, lineage.clone(), batch.num_rows()).unwrap();
 
         // D should fire for origin 1 (both B(1) and C(1) delivered),
         // even though origin 0's B-branch hasn't delivered yet.
         let ready = sched.next_ready_task().unwrap();
         assert_eq!(ready.node, d);
         assert!(
-            ready.origins.contains(&1),
+            ready.lineage.origins.contains(&1),
             "D should fire for origin 1 first, got origins {:?}",
-            ready.origins
+            ready.lineage.origins
         );
         assert!(
-            !ready.origins.contains(&0),
+            !ready.lineage.origins.contains(&0),
             "D should NOT include origin 0 (B(0) not delivered yet), got {:?}",
-            ready.origins
+            ready.lineage.origins
         );
 
         // Now deliver B(0).
         let b0_idx = 1 - b1_idx;
-        let (ref batch, ref origins) = b_outputs[b0_idx];
+        let (ref batch, ref lineage) = b_outputs[b0_idx];
         let handle = sched.transport().store(batch).unwrap();
-        sched.deliver_output(b, handle, origins.clone(), batch.num_rows()).unwrap();
+        sched.deliver_output(b, handle, lineage.clone(), batch.num_rows()).unwrap();
 
         // D should now fire for origin 0.
         let ready = sched.next_ready_task().unwrap();
         assert_eq!(ready.node, d);
-        assert_eq!(ready.origins, BTreeSet::from([0]));
+        assert_eq!(ready.lineage.origins, BTreeSet::from([0]));
     }
 }

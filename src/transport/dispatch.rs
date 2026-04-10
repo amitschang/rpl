@@ -89,6 +89,7 @@ impl DataTransport for AnyTransport {
                             handle: h.clone(),
                             num_rows: e.num_rows,
                             origins: e.origins.clone(),
+                            exec_duration_ms: e.exec_duration_ms,
                         },
                     })
                     .collect();
@@ -110,6 +111,7 @@ impl DataTransport for AnyTransport {
                         handle: AnyHandle::File(e.handle),
                         num_rows: e.num_rows,
                         origins: e.origins,
+                        exec_duration_ms: e.exec_duration_ms,
                     })
                     .collect())
             }

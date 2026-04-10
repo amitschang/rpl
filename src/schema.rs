@@ -104,6 +104,27 @@ fn types_compatible(a: &DataType, b: &DataType) -> bool {
     a == b
 }
 
+/// Build an Arrow [`Schema`] from a slice of `(name, DataType)` pairs.
+///
+/// All fields are created as nullable. This is a convenience shorthand for
+/// the common pattern of constructing schemas in task definitions.
+///
+/// ```
+/// use arrow::datatypes::DataType;
+/// use rpl::schema_of;
+///
+/// let s = schema_of(&[("id", DataType::Int64), ("value", DataType::Float64)]);
+/// assert_eq!(s.fields().len(), 2);
+/// ```
+pub fn schema_of(fields: &[(&str, DataType)]) -> Schema {
+    Schema::new(
+        fields
+            .iter()
+            .map(|(name, dt)| Field::new(*name, dt.clone(), true))
+            .collect::<Vec<_>>(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
