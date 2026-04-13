@@ -337,16 +337,8 @@ impl Default for PipelineGraph {
 mod tests {
     use super::*;
     use crate::executor::DefaultGenerator;
-    use arrow::datatypes::{DataType, Field, Schema};
-
-    fn schema(fields: &[(&str, DataType)]) -> Schema {
-        Schema::new(
-            fields
-                .iter()
-                .map(|(name, dt)| Field::new(*name, dt.clone(), true))
-                .collect::<Vec<_>>(),
-        )
-    }
+    use crate::schema::schema_of;
+    use arrow::datatypes::{DataType, Schema};
 
     fn passthrough_task(name: &str) -> TaskDef {
         TaskDef::passthrough(name, |batch| Ok(batch))
@@ -376,13 +368,13 @@ mod tests {
         let mut g = PipelineGraph::new();
         let a = g.add_task(TaskDef::new(
             "A",
-            schema(&[("id", DataType::Int64)]),
-            schema(&[("a_col", DataType::Float64)]),
+            schema_of(&[("id", DataType::Int64)]),
+            schema_of(&[("a_col", DataType::Float64)]),
             |batch| Ok(batch),
         ));
         let b = g.add_task(TaskDef::new(
             "B",
-            schema(&[("a_col", DataType::Float64)]),
+            schema_of(&[("a_col", DataType::Float64)]),
             Schema::empty(),
             |batch| Ok(batch),
         ));
@@ -397,7 +389,7 @@ mod tests {
         let a = g.add_task(TaskDef::passthrough("A", |batch| Ok(batch)));
         let b = g.add_task(TaskDef::new(
             "B",
-            schema(&[("x_col", DataType::Float64)]),
+            schema_of(&[("x_col", DataType::Float64)]),
             Schema::empty(),
             |batch| Ok(batch),
         ));
@@ -426,7 +418,7 @@ mod tests {
         );
         let b = g.add_task(TaskDef::new(
             "B",
-            schema(&[("id", DataType::Int64)]),
+            schema_of(&[("id", DataType::Int64)]),
             Schema::empty(),
             |batch| Ok(batch),
         ));
@@ -469,18 +461,18 @@ mod tests {
         let b = g.add_task(TaskDef::new(
             "B",
             Schema::empty(),
-            schema(&[("b_col", DataType::Int32)]),
+            schema_of(&[("b_col", DataType::Int32)]),
             |batch| Ok(batch),
         ));
         let c = g.add_task(TaskDef::new(
             "C",
             Schema::empty(),
-            schema(&[("c_col", DataType::Int32)]),
+            schema_of(&[("c_col", DataType::Int32)]),
             |batch| Ok(batch),
         ));
         let d = g.add_task(TaskDef::new(
             "D",
-            schema(&[("b_col", DataType::Int32)]),
+            schema_of(&[("b_col", DataType::Int32)]),
             Schema::empty(),
             |batch| Ok(batch),
         ));

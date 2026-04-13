@@ -130,30 +130,21 @@ mod tests {
     use super::*;
     use arrow::datatypes::DataType;
 
-    fn schema(fields: &[(&str, DataType)]) -> Schema {
-        Schema::new(
-            fields
-                .iter()
-                .map(|(name, dt)| Field::new(*name, dt.clone(), true))
-                .collect::<Vec<_>>(),
-        )
-    }
-
     #[test]
     fn column_set_satisfies_superset() {
-        let available = ColumnSet::from_schema(&schema(&[
+        let available = ColumnSet::from_schema(&schema_of(&[
             ("a", DataType::Int32),
             ("b", DataType::Utf8),
             ("c", DataType::Float64),
         ]));
-        let required = schema(&[("a", DataType::Int32), ("b", DataType::Utf8)]);
+        let required = schema_of(&[("a", DataType::Int32), ("b", DataType::Utf8)]);
         assert!(available.satisfies(&required, "test").is_ok());
     }
 
     #[test]
     fn column_set_missing_field() {
-        let available = ColumnSet::from_schema(&schema(&[("a", DataType::Int32)]));
-        let required = schema(&[("a", DataType::Int32), ("b", DataType::Utf8)]);
+        let available = ColumnSet::from_schema(&schema_of(&[("a", DataType::Int32)]));
+        let required = schema_of(&[("a", DataType::Int32), ("b", DataType::Utf8)]);
         let err = available.satisfies(&required, "test").unwrap_err();
         match err {
             RplError::SchemaMismatch { missing_fields, .. } => {
@@ -165,18 +156,18 @@ mod tests {
 
     #[test]
     fn column_set_type_mismatch() {
-        let available = ColumnSet::from_schema(&schema(&[("a", DataType::Utf8)]));
-        let required = schema(&[("a", DataType::Int32)]);
+        let available = ColumnSet::from_schema(&schema_of(&[("a", DataType::Utf8)]));
+        let required = schema_of(&[("a", DataType::Int32)]);
         assert!(available.satisfies(&required, "test").is_err());
     }
 
     #[test]
     fn column_set_apply() {
-        let mut cs = ColumnSet::from_schema(&schema(&[
+        let mut cs = ColumnSet::from_schema(&schema_of(&[
             ("a", DataType::Int32),
             ("b", DataType::Utf8),
         ]));
-        let produces = schema(&[("c", DataType::Float64)]);
+        let produces = schema_of(&[("c", DataType::Float64)]);
         cs.apply(&produces, &["b".to_string()]);
         assert!(cs.fields.contains_key("a"));
         assert!(!cs.fields.contains_key("b"));
@@ -185,11 +176,11 @@ mod tests {
 
     #[test]
     fn column_set_intersect() {
-        let a = ColumnSet::from_schema(&schema(&[
+        let a = ColumnSet::from_schema(&schema_of(&[
             ("x", DataType::Int32),
             ("y", DataType::Utf8),
         ]));
-        let b = ColumnSet::from_schema(&schema(&[
+        let b = ColumnSet::from_schema(&schema_of(&[
             ("x", DataType::Int32),
             ("z", DataType::Float64),
         ]));
@@ -201,7 +192,7 @@ mod tests {
 
     #[test]
     fn empty_requires_always_satisfied() {
-        let available = ColumnSet::from_schema(&schema(&[("a", DataType::Int32)]));
+        let available = ColumnSet::from_schema(&schema_of(&[("a", DataType::Int32)]));
         assert!(available.satisfies(&Schema::empty(), "test").is_ok());
     }
 }

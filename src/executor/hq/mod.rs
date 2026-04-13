@@ -605,9 +605,10 @@ mod tests {
     use crate::executor::{DefaultGenerator, Executor, SourceGenerator};
     use crate::graph::PipelineGraph;
     use crate::registry::TaskRegistry;
+    use crate::schema::schema_of;
     use crate::task::{BatchMode, TaskDef};
     use arrow::array::{Float64Array, Int64Array};
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Schema};
     use arrow::record_batch::RecordBatch;
     use std::cell::{Cell, RefCell};
     use std::collections::HashSet;
@@ -678,15 +679,6 @@ mod tests {
         }
     }
 
-    fn schema(fields: &[(&str, DataType)]) -> Schema {
-        Schema::new(
-            fields
-                .iter()
-                .map(|(name, dt)| Field::new(*name, dt.clone(), true))
-                .collect::<Vec<_>>(),
-        )
-    }
-
     /// Build an HqExecutor backed by MockHqBackend in a temp directory.
     fn mock_executor(
         graph: &PipelineGraph,
@@ -709,7 +701,7 @@ mod tests {
             .add_linear(vec![TaskDef::new(
                 "add_value",
                 Schema::empty(),
-                schema(&[("value", DataType::Float64)]),
+                schema_of(&[("value", DataType::Float64)]),
                 |batch| {
                     let len = batch.num_rows();
                     let values: Vec<f64> = (0..len).map(|i| i as f64 * 1.5).collect();
@@ -737,7 +729,7 @@ mod tests {
         let b = graph.add_task(TaskDef::new(
             "branch_b",
             Schema::empty(),
-            schema(&[("from_b", DataType::Float64)]),
+            schema_of(&[("from_b", DataType::Float64)]),
             |batch| {
                 let len = batch.num_rows();
                 batch.append_column("from_b", Arc::new(Float64Array::from(vec![1.0; len])))
@@ -746,7 +738,7 @@ mod tests {
         let c = graph.add_task(TaskDef::new(
             "branch_c",
             Schema::empty(),
-            schema(&[("from_c", DataType::Float64)]),
+            schema_of(&[("from_c", DataType::Float64)]),
             |batch| {
                 let len = batch.num_rows();
                 batch.append_column("from_c", Arc::new(Float64Array::from(vec![2.0; len])))
@@ -772,7 +764,7 @@ mod tests {
     fn max_rows_splitting() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let id_schema = schema(&[("id", DataType::Int64)]);
+        let id_schema = schema_of(&[("id", DataType::Int64)]);
         let max_seen = Arc::new(AtomicUsize::new(0));
         let max_seen_clone = max_seen.clone();
 
@@ -863,7 +855,7 @@ mod tests {
 
     #[test]
     fn fanout_mixed_batch_modes() {
-        let id_schema = schema(&[("id", DataType::Int64)]);
+        let id_schema = schema_of(&[("id", DataType::Int64)]);
 
         let mut graph = PipelineGraph::new();
         let src = graph.add_task(TaskDef::passthrough("source", |b| Ok(b)));

@@ -42,6 +42,7 @@ use rpl::{
     run_worker_if_invoked, schema_of,
 };
 use rpl::executor::local::LocalExecutor;
+use rpl::executor::threaded::ThreadExecutor;
 use rpl::task::Resources;
 
 // ---------------------------------------------------------------------------
@@ -127,6 +128,7 @@ fn main() -> rpl::Result<()> {
     // Parse CLI arguments.
     let args: Vec<String> = std::env::args().collect();
     let use_local = args.iter().any(|a| a == "--local");
+    let use_local_threaded = args.iter().any(|a| a == "--local-threaded");
     let hq_bin = args
         .windows(2)
         .find_map(|w| {
@@ -156,11 +158,16 @@ fn main() -> rpl::Result<()> {
     let tmp = tempfile::tempdir()?;
 
     let mut local_executor;
+    let mut threaded_executor;
     let mut hq_executor;
     let executor: &mut dyn Executor = if use_local {
         println!("Executor:          local (single-threaded)");
         local_executor = LocalExecutor::new().with_max_batches(NUM_SOURCE_BATCHES);
         &mut local_executor
+    } else if use_local_threaded {
+        println!("Executor:          local-threaded");
+        threaded_executor = ThreadExecutor::new().with_max_batches(NUM_SOURCE_BATCHES);
+        &mut threaded_executor
     } else {
         println!("Executor:          HQ (distributed)");
         println!("HQ binary:         {hq_bin}");

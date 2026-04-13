@@ -1,6 +1,7 @@
 pub mod hq;
 pub mod local;
 pub mod scheduler;
+pub mod threaded;
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, atomic};

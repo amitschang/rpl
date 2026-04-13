@@ -234,20 +234,12 @@ mod tests {
     use crate::batch_ext::RecordBatchExt;
     use crate::executor::{DefaultGenerator, SourceGenerator};
     use crate::graph::PipelineGraph;
+    use crate::schema::schema_of;
     use crate::task::TaskDef;
     use arrow::array::{Float64Array, Int64Array};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
-
-    fn schema(fields: &[(&str, DataType)]) -> Schema {
-        Schema::new(
-            fields
-                .iter()
-                .map(|(name, dt)| Field::new(*name, dt.clone(), true))
-                .collect::<Vec<_>>(),
-        )
-    }
 
     #[test]
     fn simple_linear_pipeline() {
@@ -257,7 +249,7 @@ mod tests {
                 TaskDef::new(
                     "add_value",
                     Schema::empty(),
-                    schema(&[("value", DataType::Float64)]),
+                    schema_of(&[("value", DataType::Float64)]),
                     |batch| {
                         let len = batch.num_rows();
                         let values: Vec<f64> = (0..len).map(|i| i as f64 * 1.5).collect();
@@ -328,7 +320,7 @@ mod tests {
         let b = graph.add_task(TaskDef::new(
             "branch_b",
             Schema::empty(),
-            schema(&[("from_b", DataType::Float64)]),
+            schema_of(&[("from_b", DataType::Float64)]),
             |batch| {
                 let len = batch.num_rows();
                 batch.append_column("from_b", Arc::new(Float64Array::from(vec![1.0; len])))
@@ -337,7 +329,7 @@ mod tests {
         let c = graph.add_task(TaskDef::new(
             "branch_c",
             Schema::empty(),
-            schema(&[("from_c", DataType::Float64)]),
+            schema_of(&[("from_c", DataType::Float64)]),
             |batch| {
                 let len = batch.num_rows();
                 batch.append_column("from_c", Arc::new(Float64Array::from(vec![2.0; len])))
@@ -377,8 +369,8 @@ mod tests {
             .add_linear(vec![
                 TaskDef::new_with_config(
                     "scale",
-                    schema(&[("id", DataType::Int64)]),
-                    schema(&[("scaled", DataType::Float64)]),
+                    schema_of(&[("id", DataType::Int64)]),
+                    schema_of(&[("scaled", DataType::Float64)]),
                     scale,
                     ScaleConfig { factor: 10.0 },
                 ),
@@ -438,7 +430,7 @@ mod tests {
         let b = graph.add_task(TaskDef::new(
             "branch_b",
             Schema::empty(),
-            schema(&[("from_b", DataType::Float64)]),
+            schema_of(&[("from_b", DataType::Float64)]),
             |batch| {
                 let len = batch.num_rows();
                 batch.append_column("from_b", Arc::new(Float64Array::from(vec![1.0; len])))
@@ -447,7 +439,7 @@ mod tests {
         let c = graph.add_task(TaskDef::new(
             "branch_c",
             Schema::empty(),
-            schema(&[("from_c", DataType::Float64)]),
+            schema_of(&[("from_c", DataType::Float64)]),
             |batch| {
                 let len = batch.num_rows();
                 batch.append_column("from_c", Arc::new(Float64Array::from(vec![2.0; len])))
@@ -488,7 +480,7 @@ mod tests {
         // Source emits 1 batch of 10 rows. The process task has MaxRows(3),
         // so the 10-row input is split before execution: 3+3+3+1.
         // The task should never see more than 3 rows at a time.
-        let id_schema = schema(&[("id", DataType::Int64)]);
+        let id_schema = schema_of(&[("id", DataType::Int64)]);
 
         struct BigSource {
             schema: Schema,
