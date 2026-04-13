@@ -3,6 +3,9 @@ pub mod local;
 pub mod scheduler;
 pub mod threaded;
 
+#[cfg(test)]
+pub(crate) mod test_fixtures;
+
 use std::collections::BTreeSet;
 use std::sync::{Arc, atomic};
 use std::time::Duration;
@@ -102,6 +105,61 @@ pub struct OutputBatch {
     pub data: RecordBatch,
     pub task: String,
     pub lineage: BatchLineage,
+}
+
+/// Shared iteration logic for all executor iterators.
+///
+/// Drains `$pending` first, then calls `$self.step()` in a loop,
+/// draining after each round.  Expressed as a macro so the borrow
+/// checker can see separate borrows of `pending_outputs` and `step()`.
+macro_rules! drain_step_loop {
+    ($self:ident) => {{
+        if let Some(output) = $self.pending_outputs.pop_front() {
+            return Some(output);
+        }
+        while $self.step() {
+            if let Some(output) = $self.pending_outputs.pop_front() {
+                return Some(output);
+            }
+        }
+        $self.pending_outputs.pop_front()
+    }};
+}
+pub(crate) use drain_step_loop;
+
+/// Result of attempting to feed one source batch into the scheduler.
+pub(crate) enum FeedResult {
+    /// A batch was enqueued successfully.
+    Fed,
+    /// Source is exhausted or max_batches reached — no more batches to feed.
+    Exhausted,
+    /// Enqueue failed.
+    Error(crate::error::RplError),
+}
+
+/// Try to feed one source batch into the scheduler.
+///
+/// Returns [`FeedResult::Fed`] if a batch was enqueued, [`Exhausted`](FeedResult::Exhausted)
+/// if the source or batch limit is reached, or [`Error`](FeedResult::Error) on failure.
+pub(crate) fn feed_source<T: crate::transport::DataTransport>(
+    source: &mut dyn SourceGenerator,
+    scheduler: &mut crate::executor::scheduler::BatchScheduler<T>,
+    max_batches: Option<usize>,
+    batch_count: &mut usize,
+) -> FeedResult {
+    if max_batches.is_some_and(|limit| *batch_count >= limit) {
+        return FeedResult::Exhausted;
+    }
+    match source.next_batch() {
+        Some(batch) => match scheduler.enqueue_source_batch(&batch) {
+            Ok(()) => {
+                *batch_count += 1;
+                FeedResult::Fed
+            }
+            Err(e) => FeedResult::Error(e),
+        },
+        None => FeedResult::Exhausted,
+    }
 }
 
 /// Trait for pipeline execution backends.

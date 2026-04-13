@@ -271,14 +271,20 @@ impl PipelineGraph {
     /// Includes task list with roles, batch modes, resources, edges,
     /// and sink-rank priority ordering.
     pub fn print_summary(&self) {
+        self.write_summary(&mut std::io::stdout().lock()).ok();
+    }
+
+    /// Write a detailed summary of the graph structure to the given writer.
+    pub fn write_summary(&self, out: &mut impl std::io::Write) -> std::io::Result<()> {
         let sources = self.source_tasks().len();
         let sinks = self.sink_tasks().len();
-        println!(
+        writeln!(
+            out,
             "Pipeline: {} tasks ({sources} source, {sinks} sink), {} edges",
             self.task_count(),
             self.graph.edge_count(),
-        );
-        println!();
+        )?;
+        writeln!(out)?;
 
         for node in self.nodes() {
             let role = match (node.is_source, node.is_sink) {
@@ -286,31 +292,33 @@ impl PipelineGraph {
                 (_, true) => "SINK  ",
                 _ => "      ",
             };
-            println!(
+            writeln!(
+                out,
                 "  [{role}] {name:<15} batch_mode={mode:?}  resources=(cpus={cpus}, gpus={gpus})",
                 name = node.name,
                 mode = node.batch_mode,
                 cpus = node.resources.num_cpus,
                 gpus = node.resources.num_gpus,
-            );
+            )?;
         }
 
-        println!();
-        println!("Edges:");
+        writeln!(out)?;
+        writeln!(out, "Edges:")?;
         for node in self.nodes() {
             for succ in self.successors(node.index) {
-                println!("  {} -> {}", node.name, self.task(succ).name);
+                writeln!(out, "  {} -> {}", node.name, self.task(succ).name)?;
             }
         }
 
-        println!();
-        println!("Sink-rank (priority ordering):");
+        writeln!(out)?;
+        writeln!(out, "Sink-rank (priority ordering):")?;
         let ranks = self.rank_from_sink();
         let mut ranked: Vec<_> = ranks.iter().collect();
         ranked.sort_by_key(|(_, r)| **r);
         for (idx, rank) in ranked {
-            println!("  {:<15} rank={}", self.task(*idx).name, rank);
+            writeln!(out, "  {:<15} rank={}", self.task(*idx).name, rank)?;
         }
+        Ok(())
     }
 }
 

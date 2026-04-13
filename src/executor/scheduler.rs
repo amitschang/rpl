@@ -10,6 +10,9 @@ use crate::graph::PipelineGraph;
 use crate::task::BatchMode;
 use crate::transport::DataTransport;
 
+/// Per-predecessor input queues for CommonOrigin nodes.
+type OriginQueues<H> = HashMap<NodeIndex, HashMap<NodeIndex, VecDeque<TaggedHandle<H>>>>;
+
 /// A batch reference annotated with lineage.
 ///
 /// `lineage.origins` tracks which source batch IDs contributed to this batch.
@@ -58,16 +61,13 @@ pub struct BatchScheduler<T: DataTransport> {
     batch_modes: HashMap<NodeIndex, BatchMode>,
     /// Successor lists per node.
     successors: HashMap<NodeIndex, Vec<NodeIndex>>,
-    /// Predecessor lists per node.
-    #[allow(dead_code)]
-    predecessors: HashMap<NodeIndex, Vec<NodeIndex>>,
 
     // --- Queues ---
     /// Input queues for non-CommonOrigin nodes.
     queues: HashMap<NodeIndex, VecDeque<TaggedHandle<T::Handle>>>,
     /// Per-predecessor input queues for CommonOrigin nodes.
     /// Key: (receiving node) -> (predecessor node) -> queue of tagged handles.
-    origin_queues: HashMap<NodeIndex, HashMap<NodeIndex, VecDeque<TaggedHandle<T::Handle>>>>,
+    origin_queues: OriginQueues<T::Handle>,
 
     /// Monotonic counter for assigning origin IDs to source batches.
     next_origin: u64,
@@ -90,7 +90,6 @@ impl<T: DataTransport> BatchScheduler<T> {
 
         let mut batch_modes = HashMap::new();
         let mut successors_map = HashMap::new();
-        let mut predecessors_map = HashMap::new();
         let mut queues = HashMap::new();
         let mut origin_queues = HashMap::new();
 
@@ -99,7 +98,6 @@ impl<T: DataTransport> BatchScheduler<T> {
             batch_modes.insert(node, task.batch_mode.clone());
             successors_map.insert(node, graph.successors(node));
             let preds = graph.predecessors(node);
-            predecessors_map.insert(node, preds.clone());
 
             match &task.batch_mode {
                 BatchMode::CommonOrigin if preds.len() >= 2 => {
@@ -127,7 +125,6 @@ impl<T: DataTransport> BatchScheduler<T> {
             sink_indices,
             batch_modes,
             successors: successors_map,
-            predecessors: predecessors_map,
             queues,
             origin_queues,
             next_origin: 0,
@@ -557,7 +554,7 @@ impl<T: DataTransport> BatchScheduler<T> {
         }
 
         let schema = batches[0].schema();
-        concat_batches(&schema, &batches).map_err(|e| RplError::Arrow(e))
+        concat_batches(&schema, &batches).map_err(RplError::Arrow)
     }
 }
 

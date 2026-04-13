@@ -5,7 +5,7 @@ use arrow::record_batch::RecordBatch;
 use serde::{Deserialize, Serialize};
 
 use crate::error::{Result, RplError};
-use crate::transport::{DataTransport, OutputEntry};
+use crate::transport::{DataTransport, OutputEntry, RefCountMap};
 
 /// A handle into the in-memory store, identified by a monotonic u64 key.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -17,7 +17,6 @@ pub struct MemoryOutputToken(u64);
 
 struct Entry {
     batch: RecordBatch,
-    ref_count: usize,
 }
 
 /// In-memory transport that stores RecordBatches in a HashMap.
@@ -27,6 +26,7 @@ struct Entry {
 /// process-local.
 pub struct InMemoryTransport {
     store: Mutex<HashMap<u64, Entry>>,
+    ref_counts: Mutex<RefCountMap<u64>>,
     output_store: Mutex<HashMap<u64, Vec<OutputEntry<MemoryHandle>>>>,
     next_id: Mutex<u64>,
 }
@@ -35,6 +35,7 @@ impl InMemoryTransport {
     pub fn new() -> Self {
         InMemoryTransport {
             store: Mutex::new(HashMap::new()),
+            ref_counts: Mutex::new(RefCountMap::new()),
             output_store: Mutex::new(HashMap::new()),
             next_id: Mutex::new(0),
         }
@@ -62,7 +63,8 @@ impl DataTransport for InMemoryTransport {
         let id = self.next_id();
 
         let mut store = self.store.lock().unwrap();
-        store.insert(id, Entry { batch: batch.clone(), ref_count: 1 });
+        store.insert(id, Entry { batch: batch.clone() });
+        self.ref_counts.lock().unwrap().insert(id);
         Ok(MemoryHandle(id))
     }
 
@@ -75,21 +77,15 @@ impl DataTransport for InMemoryTransport {
     }
 
     fn release(&self, handle: &Self::Handle) -> Result<()> {
-        let mut store = self.store.lock().unwrap();
-        if let Some(entry) = store.get_mut(&handle.0) {
-            entry.ref_count -= 1;
-            if entry.ref_count == 0 {
-                store.remove(&handle.0);
-            }
+        let mut refs = self.ref_counts.lock().unwrap();
+        if refs.release(&handle.0) {
+            self.store.lock().unwrap().remove(&handle.0);
         }
         Ok(())
     }
 
     fn add_consumers(&self, handle: &Self::Handle, additional: usize) -> Result<()> {
-        let mut store = self.store.lock().unwrap();
-        if let Some(entry) = store.get_mut(&handle.0) {
-            entry.ref_count += additional;
-        }
+        self.ref_counts.lock().unwrap().add_consumers(&handle.0, additional);
         Ok(())
     }
 
@@ -121,15 +117,7 @@ impl DataTransport for InMemoryTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::Int32Array;
-    use arrow::datatypes::{DataType, Field, Schema};
-    use std::sync::Arc;
-
-    fn test_batch() -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
-        let col = Arc::new(Int32Array::from(vec![1, 2, 3]));
-        RecordBatch::try_new(schema, vec![col]).unwrap()
-    }
+    use crate::transport::test_batch;
 
     #[test]
     fn store_load_release() {

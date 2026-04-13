@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -10,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::{Result, RplError};
-use crate::transport::{DataTransport, OutputEntry};
+use crate::transport::{DataTransport, OutputEntry, RefCountMap};
 
 /// Handle for file-based transport: just a path to an Arrow IPC file.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -38,7 +37,7 @@ impl FileOutputToken {
 /// with access to a shared filesystem.
 pub struct FileTransport {
     staging_dir: PathBuf,
-    ref_counts: Mutex<HashMap<PathBuf, usize>>,
+    ref_counts: Mutex<RefCountMap<PathBuf>>,
 }
 
 impl FileTransport {
@@ -47,7 +46,7 @@ impl FileTransport {
         fs::create_dir_all(&dir)?;
         Ok(FileTransport {
             staging_dir: dir,
-            ref_counts: Mutex::new(HashMap::new()),
+            ref_counts: Mutex::new(RefCountMap::new()),
         })
     }
 
@@ -72,7 +71,7 @@ impl DataTransport for FileTransport {
         writer.finish()?;
 
         let mut refs = self.ref_counts.lock().unwrap();
-        refs.insert(path.clone(), 1);
+        refs.insert(path.clone());
 
         Ok(FileHandle(path))
     }
@@ -89,23 +88,14 @@ impl DataTransport for FileTransport {
 
     fn release(&self, handle: &Self::Handle) -> Result<()> {
         let mut refs = self.ref_counts.lock().unwrap();
-        if let Some(count) = refs.get_mut(&handle.0) {
-            *count -= 1;
-            if *count == 0 {
-                refs.remove(&handle.0);
-                if handle.0.exists() {
-                    fs::remove_file(&handle.0)?;
-                }
-            }
+        if refs.release(&handle.0) && handle.0.exists() {
+            fs::remove_file(&handle.0)?;
         }
         Ok(())
     }
 
     fn add_consumers(&self, handle: &Self::Handle, additional: usize) -> Result<()> {
-        let mut refs = self.ref_counts.lock().unwrap();
-        if let Some(count) = refs.get_mut(&handle.0) {
-            *count += additional;
-        }
+        self.ref_counts.lock().unwrap().add_consumers(&handle.0, additional);
         Ok(())
     }
 
@@ -147,15 +137,8 @@ impl DataTransport for FileTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transport::test_batch;
     use arrow::array::Int32Array;
-    use arrow::datatypes::{DataType, Field, Schema};
-    use std::sync::Arc;
-
-    fn test_batch() -> RecordBatch {
-        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
-        let col = Arc::new(Int32Array::from(vec![10, 20, 30]));
-        RecordBatch::try_new(schema, vec![col]).unwrap()
-    }
 
     #[test]
     fn roundtrip() {
@@ -169,7 +152,7 @@ mod tests {
         assert_eq!(loaded.num_rows(), 3);
         assert_eq!(
             loaded.column(0).as_any().downcast_ref::<Int32Array>().unwrap().values(),
-            &[10, 20, 30],
+            &[1, 2, 3],
         );
 
         transport.release(&handle).unwrap();

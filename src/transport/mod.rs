@@ -2,7 +2,8 @@ pub mod dispatch;
 pub mod file;
 pub mod memory;
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::hash::Hash;
 
 use arrow::record_batch::RecordBatch;
 use serde::de::DeserializeOwned;
@@ -20,6 +21,18 @@ pub struct OutputEntry<H> {
     /// `None` for split-only operations.
     #[serde(default)]
     pub exec_duration_ms: Option<u64>,
+}
+
+impl<H> OutputEntry<H> {
+    /// Transform the handle type, preserving all other fields.
+    pub fn map_handle<U>(self, f: impl FnOnce(H) -> U) -> OutputEntry<U> {
+        OutputEntry {
+            handle: f(self.handle),
+            num_rows: self.num_rows,
+            origins: self.origins,
+            exec_duration_ms: self.exec_duration_ms,
+        }
+    }
 }
 
 /// Abstraction for moving RecordBatch data between tasks.
@@ -124,4 +137,54 @@ impl<T: DataTransport> DataTransport for std::sync::Arc<T> {
     ) -> Result<Vec<OutputEntry<Self::Handle>>> {
         (**self).collect_output(token)
     }
+}
+
+/// Reference-counted handle map used by transport implementations.
+///
+/// Tracks how many consumers hold a reference to each key. When the count
+/// reaches zero the entry is removed and an optional cleanup callback fires.
+pub(crate) struct RefCountMap<K> {
+    counts: HashMap<K, usize>,
+}
+
+impl<K: Eq + Hash + Clone> RefCountMap<K> {
+    pub fn new() -> Self {
+        Self { counts: HashMap::new() }
+    }
+
+    /// Insert a key with a reference count of 1.
+    pub fn insert(&mut self, key: K) {
+        self.counts.insert(key, 1);
+    }
+
+    /// Increment the reference count by `additional`.
+    pub fn add_consumers(&mut self, key: &K, additional: usize) {
+        if let Some(count) = self.counts.get_mut(key) {
+            *count += additional;
+        }
+    }
+
+    /// Decrement the reference count. Returns `true` if the count reached
+    /// zero and the entry was removed (caller should clean up resources).
+    pub fn release(&mut self, key: &K) -> bool {
+        if let Some(count) = self.counts.get_mut(key) {
+            *count -= 1;
+            if *count == 0 {
+                self.counts.remove(key);
+                return true;
+            }
+        }
+        false
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn test_batch() -> arrow::record_batch::RecordBatch {
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use std::sync::Arc;
+
+    let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+    let col = Arc::new(Int32Array::from(vec![1, 2, 3]));
+    arrow::record_batch::RecordBatch::try_new(schema, vec![col]).unwrap()
 }

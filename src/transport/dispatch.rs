@@ -81,17 +81,12 @@ impl DataTransport for AnyTransport {
     ) -> Result<()> {
         match (self, token) {
             (AnyTransport::File(t), AnyOutputToken::File(tok)) => {
-                // Convert AnyHandle entries to FileHandle entries.
                 let file_entries: Vec<OutputEntry<FileHandle>> = entries
                     .iter()
-                    .map(|e| match &e.handle {
-                        AnyHandle::File(h) => OutputEntry {
-                            handle: h.clone(),
-                            num_rows: e.num_rows,
-                            origins: e.origins.clone(),
-                            exec_duration_ms: e.exec_duration_ms,
-                        },
-                    })
+                    .cloned()
+                    .map(|e| e.map_handle(|h| match h {
+                        AnyHandle::File(fh) => fh,
+                    }))
                     .collect();
                 t.publish_output(tok, &file_entries)
             }
@@ -107,14 +102,84 @@ impl DataTransport for AnyTransport {
                 let file_entries = t.collect_output(tok)?;
                 Ok(file_entries
                     .into_iter()
-                    .map(|e| OutputEntry {
-                        handle: AnyHandle::File(e.handle),
-                        num_rows: e.num_rows,
-                        origins: e.origins,
-                        exec_duration_ms: e.exec_duration_ms,
-                    })
+                    .map(|e| e.map_handle(AnyHandle::File))
                     .collect())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::test_batch;
+    use arrow::array::Int32Array;
+    use std::collections::BTreeSet;
+
+    #[test]
+    fn store_load_release_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transport = AnyTransport::file(tmp.path()).unwrap();
+        let batch = test_batch();
+
+        let handle = transport.store(&batch).unwrap();
+        let loaded = transport.load(&handle).unwrap();
+        assert_eq!(loaded.num_rows(), 3);
+        assert_eq!(
+            loaded.column(0).as_any().downcast_ref::<Int32Array>().unwrap().values(),
+            &[1, 2, 3],
+        );
+
+        transport.release(&handle).unwrap();
+        // After release, loading should fail.
+        assert!(transport.load(&handle).is_err());
+    }
+
+    #[test]
+    fn publish_collect_output_roundtrip() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transport = AnyTransport::file(tmp.path()).unwrap();
+        let batch = test_batch();
+
+        let handle = transport.store(&batch).unwrap();
+        let token = transport.prepare_output().unwrap();
+
+        let entries = vec![OutputEntry {
+            handle: handle.clone(),
+            num_rows: 3,
+            origins: BTreeSet::from([0, 1]),
+            exec_duration_ms: Some(42),
+        }];
+
+        transport.publish_output(&token, &entries).unwrap();
+        let collected = transport.collect_output(&token).unwrap();
+
+        assert_eq!(collected.len(), 1);
+        assert_eq!(collected[0].num_rows, 3);
+        assert_eq!(collected[0].origins, BTreeSet::from([0, 1]));
+        assert_eq!(collected[0].exec_duration_ms, Some(42));
+
+        // Verify we can load the data via the collected handle.
+        let loaded = transport.load(&collected[0].handle).unwrap();
+        assert_eq!(loaded.num_rows(), 3);
+
+        transport.release(&handle).unwrap();
+    }
+
+    #[test]
+    fn fan_out_with_consumers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let transport = AnyTransport::file(tmp.path()).unwrap();
+        let batch = test_batch();
+
+        let handle = transport.store(&batch).unwrap();
+        transport.add_consumers(&handle, 2).unwrap(); // total 3 consumers
+
+        transport.release(&handle).unwrap();
+        assert!(transport.load(&handle).is_ok()); // still 2 consumers
+        transport.release(&handle).unwrap();
+        assert!(transport.load(&handle).is_ok()); // still 1 consumer
+        transport.release(&handle).unwrap();
+        assert!(transport.load(&handle).is_err()); // cleaned up
     }
 }

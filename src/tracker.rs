@@ -110,14 +110,7 @@ impl PipelineTracker {
 
     /// Return a snapshot of the current statistics.
     pub fn summary(&self) -> PipelineSummary {
-        let elapsed = self.start.elapsed();
-        let total_exec: Duration = self.per_task.values().map(|s| s.exec_duration).sum();
-        let total_wall: Duration = self.per_task.values().map(|s| s.wall_duration).sum();
-        let parallelism = if elapsed.as_nanos() > 0 {
-            total_exec.as_secs_f64() / elapsed.as_secs_f64()
-        } else {
-            0.0
-        };
+        let (elapsed, total_exec, total_wall, parallelism) = self.compute_totals();
 
         PipelineSummary {
             per_task: self.per_task.clone(),
@@ -163,9 +156,8 @@ impl PipelineTracker {
         }
     }
 
-    /// Write the stats table to `out`.  When `line_prefix` is non-empty each
-    /// line is prefixed with it (used by `render` to inject ANSI clear codes).
-    fn write_table(&self, out: &mut impl Write, line_prefix: &str) -> usize {
+    /// Compute derived totals from per-task stats.
+    fn compute_totals(&self) -> (Duration, Duration, Duration, f64) {
         let elapsed = self.start.elapsed();
         let total_exec: Duration = self.per_task.values().map(|s| s.exec_duration).sum();
         let total_wall: Duration = self.per_task.values().map(|s| s.wall_duration).sum();
@@ -174,6 +166,13 @@ impl PipelineTracker {
         } else {
             0.0
         };
+        (elapsed, total_exec, total_wall, parallelism)
+    }
+
+    /// Write the stats table to `out`.  When `line_prefix` is non-empty each
+    /// line is prefixed with it (used by `render` to inject ANSI clear codes).
+    fn write_table(&self, out: &mut impl Write, line_prefix: &str) -> usize {
+        let (elapsed, total_exec, total_wall, parallelism) = self.compute_totals();
 
         let mut lines = 0usize;
 
@@ -239,5 +238,126 @@ fn pct(part: Duration, total: Duration) -> f64 {
         part.as_secs_f64() / total.as_secs_f64() * 100.0
     } else {
         0.0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeSet;
+    use crate::executor::{BatchLineage, OutputBatch, PathStep};
+    use arrow::array::Int32Array;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::record_batch::RecordBatch;
+    use std::sync::Arc;
+
+    fn dummy_batch() -> RecordBatch {
+        let schema = Arc::new(Schema::new(vec![Field::new("x", DataType::Int32, false)]));
+        RecordBatch::try_new(schema, vec![Arc::new(Int32Array::from(vec![1]))]).unwrap()
+    }
+
+    fn make_output(task: &str, exec_id: u64, exec_ms: u64) -> OutputBatch {
+        OutputBatch {
+            data: dummy_batch(),
+            task: task.to_string(),
+            lineage: BatchLineage {
+                origins: BTreeSet::from([0]),
+                path: vec![PathStep {
+                    exec_id,
+                    task: task.to_string(),
+                    exec_duration: Duration::from_millis(exec_ms),
+                    wall_duration: Duration::from_millis(exec_ms),
+                }],
+            },
+        }
+    }
+
+    #[test]
+    fn basic_accumulation() {
+        let mut tracker = PipelineTracker::new(vec!["a".into(), "b".into()]);
+        tracker.update(&make_output("a", 1, 100));
+        tracker.update(&make_output("b", 2, 200));
+        tracker.update(&make_output("a", 3, 50));
+
+        let summary = tracker.summary();
+        assert_eq!(summary.sink_batches, 3);
+
+        let a = &summary.per_task["a"];
+        assert_eq!(a.runs, 2);
+        assert_eq!(a.exec_duration, Duration::from_millis(150));
+
+        let b = &summary.per_task["b"];
+        assert_eq!(b.runs, 1);
+        assert_eq!(b.exec_duration, Duration::from_millis(200));
+    }
+
+    #[test]
+    fn deduplicates_by_exec_id() {
+        let mut tracker = PipelineTracker::new(vec!["a".into()]);
+        tracker.update(&make_output("a", 42, 100));
+        tracker.update(&make_output("a", 42, 100)); // duplicate exec_id
+
+        let summary = tracker.summary();
+        assert_eq!(summary.sink_batches, 2); // both counted as sink batches
+        assert_eq!(summary.per_task["a"].runs, 1); // but task counted once
+        assert_eq!(summary.per_task["a"].exec_duration, Duration::from_millis(100));
+    }
+
+    #[test]
+    fn multi_step_lineage() {
+        let mut tracker = PipelineTracker::new(vec!["a".into(), "b".into()]);
+        let output = OutputBatch {
+            data: dummy_batch(),
+            task: "b".to_string(),
+            lineage: BatchLineage {
+                origins: BTreeSet::from([0]),
+                path: vec![
+                    PathStep {
+                        exec_id: 10,
+                        task: "a".to_string(),
+                        exec_duration: Duration::from_millis(50),
+                        wall_duration: Duration::from_millis(60),
+                    },
+                    PathStep {
+                        exec_id: 11,
+                        task: "b".to_string(),
+                        exec_duration: Duration::from_millis(100),
+                        wall_duration: Duration::from_millis(120),
+                    },
+                ],
+            },
+        };
+        tracker.update(&output);
+
+        let summary = tracker.summary();
+        assert_eq!(summary.per_task["a"].runs, 1);
+        assert_eq!(summary.per_task["b"].runs, 1);
+        assert_eq!(summary.total_exec, Duration::from_millis(150));
+        assert_eq!(summary.total_wall, Duration::from_millis(180));
+    }
+
+    #[test]
+    fn discovers_unknown_tasks() {
+        let mut tracker = PipelineTracker::new(vec!["known".into()]);
+        tracker.update(&make_output("surprise", 1, 50));
+
+        let summary = tracker.summary();
+        assert_eq!(summary.per_task["surprise"].runs, 1);
+        assert_eq!(summary.task_order, vec!["known", "surprise"]);
+    }
+
+    #[test]
+    fn write_table_output() {
+        let mut tracker = PipelineTracker::new(vec!["task_a".into()]);
+        tracker.update(&make_output("task_a", 1, 100));
+
+        let mut buf = Vec::new();
+        tracker.write_table(&mut buf, "");
+        let output = String::from_utf8(buf).unwrap();
+
+        assert!(output.contains("task_a"));
+        assert!(output.contains("TASK"));
+        assert!(output.contains("RUNS"));
+        assert!(output.contains("sink batches: 1"));
     }
 }

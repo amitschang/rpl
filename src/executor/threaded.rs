@@ -139,20 +139,19 @@ impl ThreadedIter<'_> {
 
         // 1. Feed one source batch per step.
         if !self.source_exhausted {
-            let under_limit = self.max_batches.map_or(true, |l| self.batch_count < l);
-            if under_limit {
-                if let Some(batch) = self.source.next_batch() {
-                    if let Err(e) = self.scheduler.enqueue_source_batch(&batch) {
-                        self.pending_outputs.push_back(Err(e));
-                        self.done = true;
-                        return true;
-                    }
-                    self.batch_count += 1;
-                } else {
-                    self.source_exhausted = true;
+            match super::feed_source(
+                &mut *self.source,
+                &mut self.scheduler,
+                self.max_batches,
+                &mut self.batch_count,
+            ) {
+                super::FeedResult::Fed => {}
+                super::FeedResult::Exhausted => self.source_exhausted = true,
+                super::FeedResult::Error(e) => {
+                    self.pending_outputs.push_back(Err(e));
+                    self.done = true;
+                    return true;
                 }
-            } else {
-                self.source_exhausted = true;
             }
         }
 
@@ -303,103 +302,35 @@ impl Iterator for ThreadedIter<'_> {
     type Item = Result<OutputBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // Drain any buffered outputs first.
-        if let Some(output) = self.pending_outputs.pop_front() {
-            return Some(output);
-        }
-
-        // Run scheduling rounds until we get output or exhaust the pipeline.
-        while self.step() {
-            if let Some(output) = self.pending_outputs.pop_front() {
-                return Some(output);
-            }
-        }
-
-        // Final drain after done.
-        self.pending_outputs.pop_front()
+        crate::executor::drain_step_loop!(self)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::batch_ext::RecordBatchExt;
-    use crate::executor::{DefaultGenerator, SourceGenerator};
-    use crate::graph::PipelineGraph;
+    use crate::executor::test_fixtures;
+    use crate::executor::DefaultGenerator;
     use crate::schema::schema_of;
     use crate::task::TaskDef;
-    use arrow::array::{Float64Array, Int64Array};
+    use arrow::array::Float64Array;
     use arrow::datatypes::{DataType, Schema};
-    use arrow::record_batch::RecordBatch;
     use std::sync::Arc;
 
     #[test]
     fn simple_linear_pipeline() {
-        let mut graph = PipelineGraph::new();
-        graph
-            .add_linear(vec![TaskDef::new(
-                "add_value",
-                Schema::empty(),
-                schema_of(&[("value", DataType::Float64)]),
-                |batch| {
-                    let len = batch.num_rows();
-                    let values: Vec<f64> = (0..len).map(|i| i as f64 * 1.5).collect();
-                    batch.append_column("value", Arc::new(Float64Array::from(values)))
-                },
-            )])
-            .unwrap();
-
         let mut executor = ThreadExecutor::new()
             .with_max_batches(3)
             .with_num_cpus(2);
-        let mut source = DefaultGenerator::new();
-        let results: Vec<_> = executor.run(&graph, &mut source).unwrap().collect();
-
-        assert_eq!(results.len(), 3);
-        for result in &results {
-            let batch = &result.as_ref().unwrap().data;
-            assert_eq!(batch.num_columns(), 2);
-            assert!(batch.schema().field_with_name("value").is_ok());
-        }
+        test_fixtures::assert_linear_pipeline(&mut executor);
     }
 
     #[test]
     fn diamond_graph_execution() {
-        let mut graph = PipelineGraph::new();
-        let b = graph.add_task(TaskDef::new(
-            "branch_b",
-            Schema::empty(),
-            schema_of(&[("from_b", DataType::Float64)]),
-            |batch| {
-                let len = batch.num_rows();
-                batch.append_column("from_b", Arc::new(Float64Array::from(vec![1.0; len])))
-            },
-        ));
-        let c = graph.add_task(TaskDef::new(
-            "branch_c",
-            Schema::empty(),
-            schema_of(&[("from_c", DataType::Float64)]),
-            |batch| {
-                let len = batch.num_rows();
-                batch.append_column("from_c", Arc::new(Float64Array::from(vec![2.0; len])))
-            },
-        ));
-        let d = graph.add_task(TaskDef::passthrough("merge", |batch| Ok(batch)));
-        graph.add_edge(b, d).unwrap();
-        graph.add_edge(c, d).unwrap();
-
         let mut executor = ThreadExecutor::new()
             .with_max_batches(1)
             .with_num_cpus(4);
-        let mut source = DefaultGenerator::new();
-        let results: Vec<_> = executor.run(&graph, &mut source).unwrap().collect();
-
-        assert_eq!(results.len(), 2);
-        let names: Vec<_> = results
-            .iter()
-            .map(|r| r.as_ref().unwrap().task.as_str())
-            .collect();
-        assert!(names.iter().all(|n| *n == "merge"));
+        test_fixtures::assert_diamond_graph(&mut executor);
     }
 
     #[test]
@@ -447,89 +378,15 @@ mod tests {
 
     #[test]
     fn max_rows_accumulation() {
-        let mut graph = PipelineGraph::new();
-        graph
-            .add_linear(vec![
-                TaskDef::passthrough("source", |b| Ok(b)),
-                TaskDef::passthrough("accumulate", |b| Ok(b)).with_batch_size(3),
-            ])
-            .unwrap();
-
         let mut executor = ThreadExecutor::new()
             .with_max_batches(5)
             .with_num_cpus(2);
-        let mut source = DefaultGenerator::new();
-        let results: Vec<_> = executor.run(&graph, &mut source).unwrap().collect();
-
-        assert_eq!(results.len(), 2);
-        let mut rows: Vec<usize> = results
-            .iter()
-            .map(|r| r.as_ref().unwrap().data.num_rows())
-            .collect();
-        rows.sort();
-        assert!(rows.contains(&3));
-        assert!(rows.contains(&2));
-        assert_eq!(rows.iter().sum::<usize>(), 5);
+        test_fixtures::assert_max_rows_accumulation(&mut executor);
     }
 
     #[test]
     fn input_splitting() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
-
-        let id_schema = schema_of(&[("id", DataType::Int64)]);
-
-        struct BigSource {
-            schema: Schema,
-            emitted: bool,
-        }
-        impl SourceGenerator for BigSource {
-            fn produces(&self) -> &Schema {
-                &self.schema
-            }
-            fn next_batch(&mut self) -> Option<RecordBatch> {
-                if self.emitted {
-                    return None;
-                }
-                self.emitted = true;
-                let ids: Vec<i64> = (0..10).collect();
-                Some(
-                    RecordBatch::try_new(
-                        Arc::new(self.schema.clone()),
-                        vec![Arc::new(Int64Array::from(ids))],
-                    )
-                    .unwrap(),
-                )
-            }
-        }
-
-        let max_seen = Arc::new(AtomicUsize::new(0));
-        let max_seen_clone = max_seen.clone();
-
-        let mut graph = PipelineGraph::new();
-        graph
-            .add_linear(vec![
-                TaskDef::passthrough("process", move |b: RecordBatch| {
-                    max_seen_clone.fetch_max(b.num_rows(), Ordering::Relaxed);
-                    Ok(b)
-                })
-                .with_batch_mode(BatchMode::MaxRows(3)),
-            ])
-            .unwrap();
-
         let mut executor = ThreadExecutor::new().with_num_cpus(2);
-        let mut source = BigSource {
-            schema: id_schema,
-            emitted: false,
-        };
-        let results: Vec<_> = executor.run(&graph, &mut source).unwrap().collect();
-
-        assert!(max_seen.load(Ordering::Relaxed) <= 3);
-        assert_eq!(results.len(), 4);
-        let mut rows: Vec<usize> = results
-            .iter()
-            .map(|r| r.as_ref().unwrap().data.num_rows())
-            .collect();
-        rows.sort();
-        assert_eq!(rows, vec![1, 3, 3, 3]);
+        test_fixtures::assert_input_splitting(&mut executor);
     }
 }

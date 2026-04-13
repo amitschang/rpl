@@ -38,7 +38,7 @@ impl TaskRegistry {
         self.tasks
             .get(name)
             .cloned()
-            .ok_or_else(|| RplError::Hq(format!("task '{name}' not found in registry")))
+            .ok_or_else(|| RplError::GraphError(format!("task '{name}' not found in registry")))
     }
 
     /// All registered task names.

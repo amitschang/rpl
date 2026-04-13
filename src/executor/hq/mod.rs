@@ -584,30 +584,20 @@ impl<B: HqBackend, T: DataTransport> Iterator for HqIter<'_, B, T> {
     type Item = Result<OutputBatch>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if let Some(output) = self.pending_outputs.pop_front() {
-            return Some(output);
-        }
-
-        while self.step() {
-            if let Some(output) = self.pending_outputs.pop_front() {
-                return Some(output);
-            }
-        }
-
-        self.pending_outputs.pop_front()
+        crate::executor::drain_step_loop!(self)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::batch_ext::RecordBatchExt;
+    use crate::executor::test_fixtures::{self, BigSource};
     use crate::executor::{DefaultGenerator, Executor, SourceGenerator};
     use crate::graph::PipelineGraph;
     use crate::registry::TaskRegistry;
     use crate::schema::schema_of;
     use crate::task::{BatchMode, TaskDef};
-    use arrow::array::{Float64Array, Int64Array};
+    use arrow::array::Int64Array;
     use arrow::datatypes::{DataType, Schema};
     use arrow::record_batch::RecordBatch;
     use std::cell::{Cell, RefCell};
@@ -696,20 +686,7 @@ mod tests {
 
     #[test]
     fn simple_linear_pipeline() {
-        let mut graph = PipelineGraph::new();
-        graph
-            .add_linear(vec![TaskDef::new(
-                "add_value",
-                Schema::empty(),
-                schema_of(&[("value", DataType::Float64)]),
-                |batch| {
-                    let len = batch.num_rows();
-                    let values: Vec<f64> = (0..len).map(|i| i as f64 * 1.5).collect();
-                    batch.append_column("value", Arc::new(Float64Array::from(values)))
-                },
-            )])
-            .unwrap();
-
+        let graph = test_fixtures::linear_add_value_graph();
         let (executor, _tmp) = mock_executor(&graph);
         let mut executor = executor.with_max_batches(3);
         let mut source = DefaultGenerator::new();
@@ -718,42 +695,19 @@ mod tests {
         assert_eq!(results.len(), 3);
         for result in &results {
             let batch = &result.as_ref().unwrap().data;
-            assert_eq!(batch.num_columns(), 2); // id + value
+            assert_eq!(batch.num_columns(), 2);
             assert!(batch.schema().field_with_name("value").is_ok());
         }
     }
 
     #[test]
     fn diamond_graph() {
-        let mut graph = PipelineGraph::new();
-        let b = graph.add_task(TaskDef::new(
-            "branch_b",
-            Schema::empty(),
-            schema_of(&[("from_b", DataType::Float64)]),
-            |batch| {
-                let len = batch.num_rows();
-                batch.append_column("from_b", Arc::new(Float64Array::from(vec![1.0; len])))
-            },
-        ));
-        let c = graph.add_task(TaskDef::new(
-            "branch_c",
-            Schema::empty(),
-            schema_of(&[("from_c", DataType::Float64)]),
-            |batch| {
-                let len = batch.num_rows();
-                batch.append_column("from_c", Arc::new(Float64Array::from(vec![2.0; len])))
-            },
-        ));
-        let d = graph.add_task(TaskDef::passthrough("merge", |b| Ok(b)));
-        graph.add_edge(b, d).unwrap();
-        graph.add_edge(c, d).unwrap();
-
+        let graph = test_fixtures::diamond_graph();
         let (executor, _tmp) = mock_executor(&graph);
         let mut executor = executor.with_max_batches(1);
         let mut source = DefaultGenerator::new();
         let results: Vec<_> = executor.run(&graph, &mut source).unwrap().collect();
 
-        // d receives one batch from b and one from c => 2 sink outputs.
         assert_eq!(results.len(), 2);
         for r in &results {
             assert_eq!(r.as_ref().unwrap().task, "merge");
@@ -764,52 +718,28 @@ mod tests {
     fn max_rows_splitting() {
         use std::sync::atomic::{AtomicUsize, Ordering};
 
-        let id_schema = schema_of(&[("id", DataType::Int64)]);
         let max_seen = Arc::new(AtomicUsize::new(0));
-        let max_seen_clone = max_seen.clone();
 
-        let mut graph = PipelineGraph::new();
-        graph
+        // HQ needs a "source" task before the MaxRows task so that the
+        // split-task path is exercised (source → process(MaxRows(3))).
+        let mut graph2 = PipelineGraph::new();
+        graph2
             .add_linear(vec![
                 TaskDef::passthrough("source", |b| Ok(b)),
-                TaskDef::passthrough("process", move |b: RecordBatch| {
-                    max_seen_clone.fetch_max(b.num_rows(), Ordering::Relaxed);
-                    Ok(b)
-                })
-                .with_batch_mode(BatchMode::MaxRows(3)),
+                {
+                    let max_seen_clone = max_seen.clone();
+                    TaskDef::passthrough("process", move |b: RecordBatch| {
+                        max_seen_clone.fetch_max(b.num_rows(), Ordering::Relaxed);
+                        Ok(b)
+                    })
+                    .with_batch_mode(BatchMode::MaxRows(3))
+                },
             ])
             .unwrap();
 
-        struct BigSource {
-            schema: Schema,
-            emitted: bool,
-        }
-        impl SourceGenerator for BigSource {
-            fn produces(&self) -> &Schema {
-                &self.schema
-            }
-            fn next_batch(&mut self) -> Option<RecordBatch> {
-                if self.emitted {
-                    return None;
-                }
-                self.emitted = true;
-                let ids: Vec<i64> = (0..10).collect();
-                Some(
-                    RecordBatch::try_new(
-                        Arc::new(self.schema.clone()),
-                        vec![Arc::new(Int64Array::from(ids))],
-                    )
-                    .unwrap(),
-                )
-            }
-        }
-
-        let (mut executor, _tmp) = mock_executor(&graph);
-        let mut source = BigSource {
-            schema: id_schema,
-            emitted: false,
-        };
-        let results: Vec<_> = executor.run(&graph, &mut source).unwrap().collect();
+        let (mut executor, _tmp) = mock_executor(&graph2);
+        let mut source = BigSource::new(10);
+        let results: Vec<_> = executor.run(&graph2, &mut source).unwrap().collect();
 
         assert_eq!(results.len(), 4);
         let total_rows: usize = results
