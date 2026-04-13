@@ -5,8 +5,8 @@ use serde::de::DeserializeOwned;
 
 use crate::batch_ext::RecordBatchExt;
 use crate::error::{Result, RplError};
-use crate::transport::{DataTransport, OutputEntry};
 use crate::transport::file::FileTransport;
+use crate::transport::{DataTransport, OutputEntry};
 
 use crate::registry::TaskRegistry;
 
@@ -32,9 +32,9 @@ pub fn run_worker_if_invoked(registry: &TaskRegistry) -> bool {
         if w[0] == "--output-token" {
             let token: std::result::Result<crate::transport::file::FileOutputToken, _> =
                 serde_json::from_str(&w[1]);
-            token.ok().and_then(|t| {
-                t.path().parent().map(|p| p.to_string_lossy().to_string())
-            })
+            token
+                .ok()
+                .and_then(|t| t.path().parent().map(|p| p.to_string_lossy().to_string()))
         } else {
             None
         }
@@ -217,45 +217,51 @@ fn parse_worker_args<H: DeserializeOwned, OT: DeserializeOwned>(
             }
             "--task-name" => {
                 i += 1;
-                task_name = Some(args.get(i).cloned().ok_or_else(|| {
-                    RplError::Hq("--task-name requires a value".into())
-                })?);
+                task_name = Some(
+                    args.get(i)
+                        .cloned()
+                        .ok_or_else(|| RplError::Hq("--task-name requires a value".into()))?,
+                );
             }
             "--input-handles" => {
                 i += 1;
-                let json = args.get(i).ok_or_else(|| {
-                    RplError::Hq("--input-handles requires a value".into())
-                })?;
-                input_handles = Some(serde_json::from_str(json).map_err(|e| {
-                    RplError::Hq(format!("invalid --input-handles JSON: {e}"))
-                })?);
+                let json = args
+                    .get(i)
+                    .ok_or_else(|| RplError::Hq("--input-handles requires a value".into()))?;
+                input_handles = Some(
+                    serde_json::from_str(json)
+                        .map_err(|e| RplError::Hq(format!("invalid --input-handles JSON: {e}")))?,
+                );
             }
             "--max-rows" => {
                 i += 1;
-                let val = args.get(i).ok_or_else(|| {
-                    RplError::Hq("--max-rows requires a value".into())
-                })?;
-                split_max_rows = Some(val.parse::<usize>().map_err(|e| {
-                    RplError::Hq(format!("invalid --max-rows: {e}"))
-                })?);
+                let val = args
+                    .get(i)
+                    .ok_or_else(|| RplError::Hq("--max-rows requires a value".into()))?;
+                split_max_rows = Some(
+                    val.parse::<usize>()
+                        .map_err(|e| RplError::Hq(format!("invalid --max-rows: {e}")))?,
+                );
             }
             "--origins" => {
                 i += 1;
-                let json = args.get(i).ok_or_else(|| {
-                    RplError::Hq("--origins requires a value".into())
-                })?;
-                origins = Some(serde_json::from_str(json).map_err(|e| {
-                    RplError::Hq(format!("invalid --origins JSON: {e}"))
-                })?);
+                let json = args
+                    .get(i)
+                    .ok_or_else(|| RplError::Hq("--origins requires a value".into()))?;
+                origins = Some(
+                    serde_json::from_str(json)
+                        .map_err(|e| RplError::Hq(format!("invalid --origins JSON: {e}")))?,
+                );
             }
             "--output-token" => {
                 i += 1;
-                let json = args.get(i).ok_or_else(|| {
-                    RplError::Hq("--output-token requires a value".into())
-                })?;
-                output_token = Some(serde_json::from_str(json).map_err(|e| {
-                    RplError::Hq(format!("invalid --output-token JSON: {e}"))
-                })?);
+                let json = args
+                    .get(i)
+                    .ok_or_else(|| RplError::Hq("--output-token requires a value".into()))?;
+                output_token = Some(
+                    serde_json::from_str(json)
+                        .map_err(|e| RplError::Hq(format!("invalid --output-token JSON: {e}")))?,
+                );
             }
             _ => {}
         }
@@ -265,19 +271,16 @@ fn parse_worker_args<H: DeserializeOwned, OT: DeserializeOwned>(
     let common = CommonArgs {
         input_handles: input_handles
             .ok_or_else(|| RplError::Hq("missing --input-handles".into()))?,
-        origins: origins
-            .ok_or_else(|| RplError::Hq("missing --origins".into()))?,
-        output_token: output_token
-            .ok_or_else(|| RplError::Hq("missing --output-token".into()))?,
+        origins: origins.ok_or_else(|| RplError::Hq("missing --origins".into()))?,
+        output_token: output_token.ok_or_else(|| RplError::Hq("missing --output-token".into()))?,
     };
 
     let mode = if is_split {
-        let max_rows = split_max_rows
-            .ok_or_else(|| RplError::Hq("--split requires --max-rows".into()))?;
+        let max_rows =
+            split_max_rows.ok_or_else(|| RplError::Hq("--split requires --max-rows".into()))?;
         WorkerMode::Split { max_rows }
     } else {
-        let name = task_name
-            .ok_or_else(|| RplError::Hq("missing --task-name".into()))?;
+        let name = task_name.ok_or_else(|| RplError::Hq("missing --task-name".into()))?;
         WorkerMode::Execute { task_name: name }
     };
 

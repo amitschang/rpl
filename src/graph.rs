@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use petgraph::Direction;
 use petgraph::algo::{is_cyclic_directed, toposort};
 use petgraph::graph::{DiGraph, NodeIndex};
 use petgraph::visit::EdgeRef;
-use petgraph::Direction;
 
 use crate::error::{Result, RplError};
 use crate::executor::SourceGenerator;
@@ -62,7 +62,9 @@ impl PipelineGraph {
         if is_cyclic_directed(&self.graph) {
             let edge = self.graph.find_edge(from, to).unwrap();
             self.graph.remove_edge(edge);
-            return Err(RplError::GraphError("adding this edge would create a cycle".into()));
+            return Err(RplError::GraphError(
+                "adding this edge would create a cycle".into(),
+            ));
         }
 
         Ok(())
@@ -95,12 +97,18 @@ impl PipelineGraph {
 
     /// Whether a node has no incoming edges.
     pub fn is_source(&self, index: NodeIndex) -> bool {
-        self.graph.edges_directed(index, Direction::Incoming).next().is_none()
+        self.graph
+            .edges_directed(index, Direction::Incoming)
+            .next()
+            .is_none()
     }
 
     /// Whether a node has no outgoing edges.
     pub fn is_sink(&self, index: NodeIndex) -> bool {
-        self.graph.edges_directed(index, Direction::Outgoing).next().is_none()
+        self.graph
+            .edges_directed(index, Direction::Outgoing)
+            .next()
+            .is_none()
     }
 
     /// Get a [`Node`] reference by index.
@@ -135,12 +143,18 @@ impl PipelineGraph {
 
     /// Source nodes (no incoming edges).
     pub fn source_nodes(&self) -> Vec<Node<'_>> {
-        self.source_tasks().into_iter().map(|i| self.node(i)).collect()
+        self.source_tasks()
+            .into_iter()
+            .map(|i| self.node(i))
+            .collect()
     }
 
     /// Sink nodes (no outgoing edges).
     pub fn sink_nodes(&self) -> Vec<Node<'_>> {
-        self.sink_tasks().into_iter().map(|i| self.node(i)).collect()
+        self.sink_tasks()
+            .into_iter()
+            .map(|i| self.node(i))
+            .collect()
     }
 
     /// Predecessor node indices (upstream tasks).
@@ -410,8 +424,7 @@ mod tests {
         // A tries to drop "nonexistent" which isn't available.
         let mut g = PipelineGraph::new();
         g.add_task(
-            TaskDef::passthrough("A", |batch| Ok(batch))
-                .with_drops(vec!["nonexistent".into()]),
+            TaskDef::passthrough("A", |batch| Ok(batch)).with_drops(vec!["nonexistent".into()]),
         );
         assert!(g.validate(&DefaultGenerator::new()).is_err());
     }
@@ -420,10 +433,8 @@ mod tests {
     fn schema_drop_removes_column() {
         // A drops "id", B requires "id" => should fail.
         let mut g = PipelineGraph::new();
-        let a = g.add_task(
-            TaskDef::passthrough("A", |batch| Ok(batch))
-                .with_drops(vec!["id".into()]),
-        );
+        let a =
+            g.add_task(TaskDef::passthrough("A", |batch| Ok(batch)).with_drops(vec!["id".into()]));
         let b = g.add_task(TaskDef::new(
             "B",
             schema_of(&[("id", DataType::Int64)]),

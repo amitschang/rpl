@@ -58,10 +58,8 @@ impl RecordBatchExt for RecordBatch {
             .as_any()
             .downcast_ref::<T>()
             .ok_or_else(|| {
-                ArrowError::CastError(format!(
-                    "column '{name}' cannot be cast to requested type"
-                ))
-                .into()
+                ArrowError::CastError(format!("column '{name}' cannot be cast to requested type"))
+                    .into()
             })
     }
 

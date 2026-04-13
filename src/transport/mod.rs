@@ -89,10 +89,7 @@ pub trait DataTransport {
     ///
     /// Consumes the token — the underlying resource (e.g. manifest file)
     /// is cleaned up.
-    fn collect_output(
-        &self,
-        token: &Self::OutputToken,
-    ) -> Result<Vec<OutputEntry<Self::Handle>>>;
+    fn collect_output(&self, token: &Self::OutputToken) -> Result<Vec<OutputEntry<Self::Handle>>>;
 }
 
 /// Blanket implementation so `Arc<T>` can be used as a shared transport.
@@ -131,10 +128,7 @@ impl<T: DataTransport> DataTransport for std::sync::Arc<T> {
         (**self).publish_output(token, entries)
     }
 
-    fn collect_output(
-        &self,
-        token: &Self::OutputToken,
-    ) -> Result<Vec<OutputEntry<Self::Handle>>> {
+    fn collect_output(&self, token: &Self::OutputToken) -> Result<Vec<OutputEntry<Self::Handle>>> {
         (**self).collect_output(token)
     }
 }
@@ -149,7 +143,9 @@ pub(crate) struct RefCountMap<K> {
 
 impl<K: Eq + Hash + Clone> RefCountMap<K> {
     pub fn new() -> Self {
-        Self { counts: HashMap::new() }
+        Self {
+            counts: HashMap::new(),
+        }
     }
 
     /// Insert a key with a reference count of 1.

@@ -21,9 +21,7 @@ pub struct LocalExecutor {
 
 impl LocalExecutor {
     pub fn new() -> Self {
-        LocalExecutor {
-            max_batches: None,
-        }
+        LocalExecutor { max_batches: None }
     }
 
     /// Limit the number of source batches generated.
@@ -176,12 +174,10 @@ impl<'a> LocalIter<'a> {
                             return true;
                         }
                     };
-                    if let Err(e) = self.scheduler.deliver_output(
-                        node_idx,
-                        handle,
-                        new_lineage,
-                        num_rows,
-                    ) {
+                    if let Err(e) =
+                        self.scheduler
+                            .deliver_output(node_idx, handle, new_lineage, num_rows)
+                    {
                         self.pending_outputs.push_back(Err(e));
                         self.done = true;
                         return true;
@@ -284,21 +280,23 @@ mod tests {
 
         fn scale(batch: RecordBatch, config: &ScaleConfig) -> crate::error::Result<RecordBatch> {
             let id_col = batch.column_as::<Int64Array>("id")?;
-            let scaled: Vec<f64> = id_col.values().iter().map(|v| *v as f64 * config.factor).collect();
+            let scaled: Vec<f64> = id_col
+                .values()
+                .iter()
+                .map(|v| *v as f64 * config.factor)
+                .collect();
             batch.append_column("scaled", Arc::new(Float64Array::from(scaled)))
         }
 
         let mut graph = PipelineGraph::new();
         graph
-            .add_linear(vec![
-                TaskDef::new_with_config(
-                    "scale",
-                    schema_of(&[("id", DataType::Int64)]),
-                    schema_of(&[("scaled", DataType::Float64)]),
-                    scale,
-                    ScaleConfig { factor: 10.0 },
-                ),
-            ])
+            .add_linear(vec![TaskDef::new_with_config(
+                "scale",
+                schema_of(&[("id", DataType::Int64)]),
+                schema_of(&[("scaled", DataType::Float64)]),
+                scale,
+                ScaleConfig { factor: 10.0 },
+            )])
             .unwrap();
 
         let mut executor = LocalExecutor::new().with_max_batches(1);
@@ -344,8 +342,7 @@ mod tests {
             },
         ));
         let d = graph.add_task(
-            TaskDef::passthrough("merge", |b| Ok(b))
-                .with_batch_mode(BatchMode::CommonOrigin),
+            TaskDef::passthrough("merge", |b| Ok(b)).with_batch_mode(BatchMode::CommonOrigin),
         );
         graph.add_edge(b, d).unwrap();
         graph.add_edge(c, d).unwrap();
@@ -380,9 +377,7 @@ mod tests {
         // 3 batches of 1 row each -> 3 outputs (no merging).
         let mut graph = PipelineGraph::new();
         graph
-            .add_linear(vec![
-                TaskDef::passthrough("middle", |b| Ok(b)),
-            ])
+            .add_linear(vec![TaskDef::passthrough("middle", |b| Ok(b))])
             .unwrap();
 
         let mut executor = LocalExecutor::new().with_max_batches(3);

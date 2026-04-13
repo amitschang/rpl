@@ -97,12 +97,7 @@ impl TaskDef {
     /// use arrow::datatypes::Schema;
     /// let task = TaskDef::new("passthrough", Schema::empty(), Schema::empty(), |batch| Ok(batch));
     /// ```
-    pub fn new<F>(
-        name: impl Into<String>,
-        requires: Schema,
-        produces: Schema,
-        func: F,
-    ) -> Self
+    pub fn new<F>(name: impl Into<String>, requires: Schema, produces: Schema, func: F) -> Self
     where
         F: Fn(RecordBatch) -> Result<RecordBatch> + Send + Sync + 'static,
     {
@@ -115,7 +110,10 @@ impl TaskDef {
             requires,
             produces,
             drops: Vec::new(),
-            resources: Resources { num_cpus: 1, ..Default::default() },
+            resources: Resources {
+                num_cpus: 1,
+                ..Default::default()
+            },
             batch_mode: BatchMode::default(),
         }
     }
@@ -151,13 +149,19 @@ impl TaskDef {
             requires,
             produces,
             drops: Vec::new(),
-            resources: Resources { num_cpus: 1, ..Default::default() },
+            resources: Resources {
+                num_cpus: 1,
+                ..Default::default()
+            },
             batch_mode: BatchMode::default(),
         }
     }
 
     /// Convenience constructor for a passthrough task (requires/produces/drops nothing).
-    pub fn passthrough(name: impl Into<String>, func: impl Fn(RecordBatch) -> Result<RecordBatch> + Send + Sync + 'static) -> Self {
+    pub fn passthrough(
+        name: impl Into<String>,
+        func: impl Fn(RecordBatch) -> Result<RecordBatch> + Send + Sync + 'static,
+    ) -> Self {
         Self::new(name, Schema::empty(), Schema::empty(), func)
     }
 

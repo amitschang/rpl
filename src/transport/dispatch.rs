@@ -84,19 +84,18 @@ impl DataTransport for AnyTransport {
                 let file_entries: Vec<OutputEntry<FileHandle>> = entries
                     .iter()
                     .cloned()
-                    .map(|e| e.map_handle(|h| match h {
-                        AnyHandle::File(fh) => fh,
-                    }))
+                    .map(|e| {
+                        e.map_handle(|h| match h {
+                            AnyHandle::File(fh) => fh,
+                        })
+                    })
                     .collect();
                 t.publish_output(tok, &file_entries)
             }
         }
     }
 
-    fn collect_output(
-        &self,
-        token: &Self::OutputToken,
-    ) -> Result<Vec<OutputEntry<Self::Handle>>> {
+    fn collect_output(&self, token: &Self::OutputToken) -> Result<Vec<OutputEntry<Self::Handle>>> {
         match (self, token) {
             (AnyTransport::File(t), AnyOutputToken::File(tok)) => {
                 let file_entries = t.collect_output(tok)?;
@@ -126,7 +125,12 @@ mod tests {
         let loaded = transport.load(&handle).unwrap();
         assert_eq!(loaded.num_rows(), 3);
         assert_eq!(
-            loaded.column(0).as_any().downcast_ref::<Int32Array>().unwrap().values(),
+            loaded
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values(),
             &[1, 2, 3],
         );
 

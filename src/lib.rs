@@ -1,20 +1,24 @@
 pub mod batch_ext;
 pub mod error;
-pub mod schema;
-pub mod task;
+pub mod executor;
 pub mod graph;
 pub mod registry;
-pub mod transport;
-pub mod executor;
+pub mod schema;
+pub mod task;
 pub mod tracker;
+pub mod transport;
 
 pub use batch_ext::RecordBatchExt;
 pub use error::{Result, RplError};
-pub use schema::schema_of;
-pub use task::{TaskDef, Resources, BatchMode};
-pub use graph::{PipelineGraph, Node};
+pub use executor::hq::{
+    HqBackend, HqClient, HqExecutor, run_worker_if_invoked, run_worker_if_invoked_with,
+};
+pub use executor::{
+    BatchLineage, DefaultGenerator, Executor, OutputBatch, PathStep, SourceGenerator,
+};
+pub use graph::{Node, PipelineGraph};
 pub use registry::TaskRegistry;
-pub use executor::{Executor, OutputBatch, SourceGenerator, DefaultGenerator, BatchLineage, PathStep};
-pub use tracker::{PipelineTracker, PipelineSummary, TaskStats};
-pub use executor::hq::{HqExecutor, HqClient, HqBackend, run_worker_if_invoked, run_worker_if_invoked_with};
+pub use schema::schema_of;
+pub use task::{BatchMode, Resources, TaskDef};
+pub use tracker::{PipelineSummary, PipelineTracker, TaskStats};
 pub use transport::DataTransport;

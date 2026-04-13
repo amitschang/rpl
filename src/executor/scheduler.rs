@@ -275,7 +275,9 @@ impl<T: DataTransport> BatchScheduler<T> {
             }
             let tagged = queue.pop_front().unwrap();
             collected_rows += tagged.num_rows;
-            lineage.origins.extend(tagged.lineage.origins.iter().copied());
+            lineage
+                .origins
+                .extend(tagged.lineage.origins.iter().copied());
             // Merge paths: take the longest path as representative when
             // accumulating multiple batches (they share the same route).
             if tagged.lineage.path.len() > lineage.path.len() {
@@ -368,7 +370,12 @@ impl<T: DataTransport> BatchScheduler<T> {
                     if indices.contains(&i) {
                         continue;
                     }
-                    if tagged.lineage.origins.iter().any(|o| group_origins.contains(o)) {
+                    if tagged
+                        .lineage
+                        .origins
+                        .iter()
+                        .any(|o| group_origins.contains(o))
+                    {
                         group_origins.extend(tagged.lineage.origins.iter().copied());
                         indices.push(i);
                         expanded = true;
@@ -497,7 +504,10 @@ impl<T: DataTransport> BatchScheduler<T> {
     /// Successor node indices for a given node.
     pub fn successors_of(&self, node: NodeIndex) -> &[NodeIndex] {
         // Return slice from the stored Vec.
-        self.successors.get(&node).map(|v| v.as_slice()).unwrap_or(&[])
+        self.successors
+            .get(&node)
+            .map(|v| v.as_slice())
+            .unwrap_or(&[])
     }
 
     /// Route a sink task's output to the pending output buffer.
@@ -600,14 +610,18 @@ mod tests {
         let batch = sched.load_and_concat(&ready.handles).unwrap();
         sched.release_handles(&ready.handles).unwrap();
         let handle = sched.transport().store(&batch).unwrap();
-        sched.deliver_output(ready.node, handle, ready.lineage, batch.num_rows()).unwrap();
+        sched
+            .deliver_output(ready.node, handle, ready.lineage, batch.num_rows())
+            .unwrap();
 
         // Process second source batch.
         let ready = sched.next_ready_task().unwrap();
         let batch = sched.load_and_concat(&ready.handles).unwrap();
         sched.release_handles(&ready.handles).unwrap();
         let handle = sched.transport().store(&batch).unwrap();
-        sched.deliver_output(ready.node, handle, ready.lineage, batch.num_rows()).unwrap();
+        sched
+            .deliver_output(ready.node, handle, ready.lineage, batch.num_rows())
+            .unwrap();
 
         // Accumulate node should NOT be ready yet (2 rows < 3).
         // Next ready should be None (sink has nothing, accumulate not ready).
@@ -619,7 +633,9 @@ mod tests {
         let batch = sched.load_and_concat(&ready.handles).unwrap();
         sched.release_handles(&ready.handles).unwrap();
         let handle = sched.transport().store(&batch).unwrap();
-        sched.deliver_output(ready.node, handle, ready.lineage, batch.num_rows()).unwrap();
+        sched
+            .deliver_output(ready.node, handle, ready.lineage, batch.num_rows())
+            .unwrap();
 
         // Now accumulate should be ready with 3 rows.
         let ready = sched.next_ready_task().unwrap();
@@ -651,7 +667,9 @@ mod tests {
             let batch = sched.load_and_concat(&ready.handles).unwrap();
             sched.release_handles(&ready.handles).unwrap();
             let handle = sched.transport().store(&batch).unwrap();
-            sched.deliver_output(ready.node, handle, ready.lineage, batch.num_rows()).unwrap();
+            sched
+                .deliver_output(ready.node, handle, ready.lineage, batch.num_rows())
+                .unwrap();
         }
 
         // Accumulate not ready (2 < 5).
@@ -691,7 +709,9 @@ mod tests {
         let batch = sched.load_and_concat(&ready.handles).unwrap();
         sched.release_handles(&ready.handles).unwrap();
         let handle = sched.transport().store(&batch).unwrap();
-        sched.deliver_output(ready.node, handle, ready.lineage, batch.num_rows()).unwrap();
+        sched
+            .deliver_output(ready.node, handle, ready.lineage, batch.num_rows())
+            .unwrap();
 
         // D should NOT be ready yet (only one predecessor has delivered).
         // Should get B or C next.
@@ -700,7 +720,9 @@ mod tests {
         let batch = sched.load_and_concat(&ready.handles).unwrap();
         sched.release_handles(&ready.handles).unwrap();
         let handle = sched.transport().store(&batch).unwrap();
-        sched.deliver_output(ready.node, handle, ready.lineage, batch.num_rows()).unwrap();
+        sched
+            .deliver_output(ready.node, handle, ready.lineage, batch.num_rows())
+            .unwrap();
 
         // D still not ready (missing one predecessor).
         // Should get the other branch.
@@ -710,7 +732,9 @@ mod tests {
         let batch = sched.load_and_concat(&ready.handles).unwrap();
         sched.release_handles(&ready.handles).unwrap();
         let handle = sched.transport().store(&batch).unwrap();
-        sched.deliver_output(ready.node, handle, ready.lineage, batch.num_rows()).unwrap();
+        sched
+            .deliver_output(ready.node, handle, ready.lineage, batch.num_rows())
+            .unwrap();
 
         // Now D should be ready with contributions from both B and C.
         let ready = sched.next_ready_task().unwrap();
@@ -732,9 +756,7 @@ mod tests {
 
         let mut graph = PipelineGraph::new();
         let a = graph.add_task(TaskDef::passthrough("A", |b| Ok(b)));
-        let b0 = graph.add_task(
-            TaskDef::passthrough("B0", |b| Ok(b)).with_batch_size(2),
-        );
+        let b0 = graph.add_task(TaskDef::passthrough("B0", |b| Ok(b)).with_batch_size(2));
         let b = graph.add_task(TaskDef::passthrough("B", |b| Ok(b)));
         let c = graph.add_task(TaskDef::passthrough("C", |b| Ok(b)));
         let d = graph.add_task(
@@ -766,7 +788,9 @@ mod tests {
                         let batch = sched.load_and_concat(&r.handles).unwrap();
                         sched.release_handles(&r.handles).unwrap();
                         let handle = sched.transport().store(&batch).unwrap();
-                        sched.deliver_output(r.node, handle, r.lineage, batch.num_rows()).unwrap();
+                        sched
+                            .deliver_output(r.node, handle, r.lineage, batch.num_rows())
+                            .unwrap();
                         return true;
                     }
                     None => break,
@@ -851,7 +875,10 @@ mod tests {
                 None => break,
             }
         }
-        assert!(processed_e, "E should have fired with 3 predecessor contributions");
+        assert!(
+            processed_e,
+            "E should have fired with 3 predecessor contributions"
+        );
     }
 
     #[test]
@@ -919,12 +946,19 @@ mod tests {
         // Deliver to D in this order: C(0), C(1), B(1) — withholding B(0).
         for (batch, lineage) in &c_outputs {
             let handle = sched.transport().store(batch).unwrap();
-            sched.deliver_output(c, handle, lineage.clone(), batch.num_rows()).unwrap();
+            sched
+                .deliver_output(c, handle, lineage.clone(), batch.num_rows())
+                .unwrap();
         }
-        let b1_idx = b_outputs.iter().position(|(_, l)| l.origins.contains(&1)).unwrap();
+        let b1_idx = b_outputs
+            .iter()
+            .position(|(_, l)| l.origins.contains(&1))
+            .unwrap();
         let (ref batch, ref lineage) = b_outputs[b1_idx];
         let handle = sched.transport().store(batch).unwrap();
-        sched.deliver_output(b, handle, lineage.clone(), batch.num_rows()).unwrap();
+        sched
+            .deliver_output(b, handle, lineage.clone(), batch.num_rows())
+            .unwrap();
 
         // D should fire for origin 1 (both B(1) and C(1) delivered),
         // even though origin 0's B-branch hasn't delivered yet.
@@ -945,7 +979,9 @@ mod tests {
         let b0_idx = 1 - b1_idx;
         let (ref batch, ref lineage) = b_outputs[b0_idx];
         let handle = sched.transport().store(batch).unwrap();
-        sched.deliver_output(b, handle, lineage.clone(), batch.num_rows()).unwrap();
+        sched
+            .deliver_output(b, handle, lineage.clone(), batch.num_rows())
+            .unwrap();
 
         // D should now fire for origin 0.
         let ready = sched.next_ready_task().unwrap();

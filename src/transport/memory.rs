@@ -63,7 +63,12 @@ impl DataTransport for InMemoryTransport {
         let id = self.next_id();
 
         let mut store = self.store.lock().unwrap();
-        store.insert(id, Entry { batch: batch.clone() });
+        store.insert(
+            id,
+            Entry {
+                batch: batch.clone(),
+            },
+        );
         self.ref_counts.lock().unwrap().insert(id);
         Ok(MemoryHandle(id))
     }
@@ -85,7 +90,10 @@ impl DataTransport for InMemoryTransport {
     }
 
     fn add_consumers(&self, handle: &Self::Handle, additional: usize) -> Result<()> {
-        self.ref_counts.lock().unwrap().add_consumers(&handle.0, additional);
+        self.ref_counts
+            .lock()
+            .unwrap()
+            .add_consumers(&handle.0, additional);
         Ok(())
     }
 
@@ -103,14 +111,11 @@ impl DataTransport for InMemoryTransport {
         Ok(())
     }
 
-    fn collect_output(
-        &self,
-        token: &Self::OutputToken,
-    ) -> Result<Vec<OutputEntry<Self::Handle>>> {
+    fn collect_output(&self, token: &Self::OutputToken) -> Result<Vec<OutputEntry<Self::Handle>>> {
         let mut store = self.output_store.lock().unwrap();
-        store.remove(&token.0).ok_or_else(|| {
-            RplError::Transport(format!("output token {:?} not found", token))
-        })
+        store
+            .remove(&token.0)
+            .ok_or_else(|| RplError::Transport(format!("output token {:?} not found", token)))
     }
 }
 

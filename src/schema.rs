@@ -77,7 +77,8 @@ impl ColumnSet {
             self.fields.remove(name);
         }
         for field in produces.fields() {
-            self.fields.insert(field.name().clone(), field.as_ref().clone());
+            self.fields
+                .insert(field.name().clone(), field.as_ref().clone());
         }
     }
 
@@ -163,10 +164,8 @@ mod tests {
 
     #[test]
     fn column_set_apply() {
-        let mut cs = ColumnSet::from_schema(&schema_of(&[
-            ("a", DataType::Int32),
-            ("b", DataType::Utf8),
-        ]));
+        let mut cs =
+            ColumnSet::from_schema(&schema_of(&[("a", DataType::Int32), ("b", DataType::Utf8)]));
         let produces = schema_of(&[("c", DataType::Float64)]);
         cs.apply(&produces, &["b".to_string()]);
         assert!(cs.fields.contains_key("a"));
@@ -176,10 +175,8 @@ mod tests {
 
     #[test]
     fn column_set_intersect() {
-        let a = ColumnSet::from_schema(&schema_of(&[
-            ("x", DataType::Int32),
-            ("y", DataType::Utf8),
-        ]));
+        let a =
+            ColumnSet::from_schema(&schema_of(&[("x", DataType::Int32), ("y", DataType::Utf8)]));
         let b = ColumnSet::from_schema(&schema_of(&[
             ("x", DataType::Int32),
             ("z", DataType::Float64),

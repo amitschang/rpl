@@ -95,7 +95,10 @@ impl DataTransport for FileTransport {
     }
 
     fn add_consumers(&self, handle: &Self::Handle, additional: usize) -> Result<()> {
-        self.ref_counts.lock().unwrap().add_consumers(&handle.0, additional);
+        self.ref_counts
+            .lock()
+            .unwrap()
+            .add_consumers(&handle.0, additional);
         Ok(())
     }
 
@@ -117,10 +120,7 @@ impl DataTransport for FileTransport {
         Ok(())
     }
 
-    fn collect_output(
-        &self,
-        token: &Self::OutputToken,
-    ) -> Result<Vec<OutputEntry<Self::Handle>>> {
+    fn collect_output(&self, token: &Self::OutputToken) -> Result<Vec<OutputEntry<Self::Handle>>> {
         let json = fs::read_to_string(&token.0).map_err(|e| {
             RplError::Hq(format!(
                 "failed to read manifest {}: {e}",
@@ -151,7 +151,12 @@ mod tests {
         let loaded = transport.load(&handle).unwrap();
         assert_eq!(loaded.num_rows(), 3);
         assert_eq!(
-            loaded.column(0).as_any().downcast_ref::<Int32Array>().unwrap().values(),
+            loaded
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .unwrap()
+                .values(),
             &[1, 2, 3],
         );
 

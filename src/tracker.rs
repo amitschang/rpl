@@ -141,10 +141,7 @@ impl PipelineTracker {
     fn ingest_lineage(&mut self, output: &OutputBatch) {
         for step in &output.lineage.path {
             if self.seen.insert(step.exec_id) {
-                let entry = self
-                    .per_task
-                    .entry(step.task.clone())
-                    .or_default();
+                let entry = self.per_task.entry(step.task.clone()).or_default();
                 entry.runs += 1;
                 entry.exec_duration += step.exec_duration;
                 entry.wall_duration += step.wall_duration;
@@ -244,11 +241,11 @@ fn pct(part: Duration, total: Duration) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::BTreeSet;
     use crate::executor::{BatchLineage, OutputBatch, PathStep};
     use arrow::array::Int32Array;
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
+    use std::collections::BTreeSet;
     use std::sync::Arc;
 
     fn dummy_batch() -> RecordBatch {
@@ -300,7 +297,10 @@ mod tests {
         let summary = tracker.summary();
         assert_eq!(summary.sink_batches, 2); // both counted as sink batches
         assert_eq!(summary.per_task["a"].runs, 1); // but task counted once
-        assert_eq!(summary.per_task["a"].exec_duration, Duration::from_millis(100));
+        assert_eq!(
+            summary.per_task["a"].exec_duration,
+            Duration::from_millis(100)
+        );
     }
 
     #[test]

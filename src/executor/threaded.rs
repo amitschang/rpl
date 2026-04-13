@@ -9,7 +9,9 @@ use petgraph::graph::NodeIndex;
 use crate::batch_ext::RecordBatchExt;
 use crate::error::Result;
 use crate::executor::scheduler::BatchScheduler;
-use crate::executor::{BatchLineage, Executor, OutputBatch, PathStep, SourceGenerator, next_exec_id};
+use crate::executor::{
+    BatchLineage, Executor, OutputBatch, PathStep, SourceGenerator, next_exec_id,
+};
 use crate::graph::PipelineGraph;
 use crate::task::BatchMode;
 use crate::transport::DataTransport;
@@ -290,7 +292,10 @@ impl ThreadedIter<'_> {
                     return;
                 }
             };
-            if let Err(e) = self.scheduler.deliver_output(chunk.node, handle, lineage, num_rows) {
+            if let Err(e) = self
+                .scheduler
+                .deliver_output(chunk.node, handle, lineage, num_rows)
+            {
                 self.pending_outputs.push_back(Err(e));
                 self.done = true;
             }
@@ -309,8 +314,8 @@ impl Iterator for ThreadedIter<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::executor::test_fixtures;
     use crate::executor::DefaultGenerator;
+    use crate::executor::test_fixtures;
     use crate::schema::schema_of;
     use crate::task::TaskDef;
     use arrow::array::Float64Array;
@@ -319,17 +324,13 @@ mod tests {
 
     #[test]
     fn simple_linear_pipeline() {
-        let mut executor = ThreadExecutor::new()
-            .with_max_batches(3)
-            .with_num_cpus(2);
+        let mut executor = ThreadExecutor::new().with_max_batches(3).with_num_cpus(2);
         test_fixtures::assert_linear_pipeline(&mut executor);
     }
 
     #[test]
     fn diamond_graph_execution() {
-        let mut executor = ThreadExecutor::new()
-            .with_max_batches(1)
-            .with_num_cpus(4);
+        let mut executor = ThreadExecutor::new().with_max_batches(1).with_num_cpus(4);
         test_fixtures::assert_diamond_graph(&mut executor);
     }
 
@@ -378,9 +379,7 @@ mod tests {
 
     #[test]
     fn max_rows_accumulation() {
-        let mut executor = ThreadExecutor::new()
-            .with_max_batches(5)
-            .with_num_cpus(2);
+        let mut executor = ThreadExecutor::new().with_max_batches(5).with_num_cpus(2);
         test_fixtures::assert_max_rows_accumulation(&mut executor);
     }
 

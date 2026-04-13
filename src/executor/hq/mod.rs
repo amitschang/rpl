@@ -14,7 +14,9 @@ use petgraph::graph::NodeIndex;
 
 use crate::error::{Result, RplError};
 use crate::executor::scheduler::{BatchScheduler, TaggedHandle};
-use crate::executor::{BatchLineage, Executor, OutputBatch, PathStep, SourceGenerator, next_exec_id};
+use crate::executor::{
+    BatchLineage, Executor, OutputBatch, PathStep, SourceGenerator, next_exec_id,
+};
 use crate::graph::PipelineGraph;
 use crate::task::BatchMode;
 use crate::transport::DataTransport;
@@ -45,9 +47,7 @@ impl HqExecutor<HqClient, FileTransport> {
     ///
     /// Uses `"hq"` from PATH by default; call
     /// [`with_hq_binary`](Self::with_hq_binary) to override.
-    pub fn new(
-        staging_dir: impl Into<PathBuf>,
-    ) -> Result<Self> {
+    pub fn new(staging_dir: impl Into<PathBuf>) -> Result<Self> {
         let transport = Arc::new(FileTransport::new(staging_dir)?);
         Ok(HqExecutor {
             client: HqClient::new("hq"),
@@ -234,9 +234,7 @@ impl<B: HqBackend, T: DataTransport> HqIter<'_, B, T> {
 
                 // Drain scheduler after each source batch to submit HQ tasks.
                 while let Some(ready) = self.scheduler.next_ready_task() {
-                    if let Err(e) =
-                        self.submit_hq_task(ready.node, ready.handles, ready.lineage)
-                    {
+                    if let Err(e) = self.submit_hq_task(ready.node, ready.handles, ready.lineage) {
                         self.pending_outputs.push_back(Err(e));
                         self.done = true;
                         return true;
@@ -287,10 +285,9 @@ impl<B: HqBackend, T: DataTransport> HqIter<'_, B, T> {
         let priority = self.priorities[&node];
 
         // Serialize input handles and origins to JSON.
-        let input_handles_json = serde_json::to_string(
-            &handles.iter().map(|h| &h.handle).collect::<Vec<_>>(),
-        )
-        .map_err(|e| RplError::Hq(format!("failed to serialize input handles: {e}")))?;
+        let input_handles_json =
+            serde_json::to_string(&handles.iter().map(|h| &h.handle).collect::<Vec<_>>())
+                .map_err(|e| RplError::Hq(format!("failed to serialize input handles: {e}")))?;
 
         let origins_json = serde_json::to_string(&lineage.origins)
             .map_err(|e| RplError::Hq(format!("failed to serialize origins: {e}")))?;
@@ -374,9 +371,9 @@ impl<B: HqBackend, T: DataTransport> HqIter<'_, B, T> {
 
         // Split tasks use minimal resources.
         let resources = crate::task::Resources::default();
-        let hq_task_id =
-            self.client
-                .submit_task(self.job_id, &command, priority, &resources)?;
+        let hq_task_id = self
+            .client
+            .submit_task(self.job_id, &command, priority, &resources)?;
 
         self.in_flight.insert(
             hq_task_id,
@@ -650,7 +647,11 @@ mod tests {
             Ok(id)
         }
 
-        fn poll_tasks(&self, _job_id: u64, _task_ids: &[u64]) -> crate::error::Result<JobPollResult> {
+        fn poll_tasks(
+            &self,
+            _job_id: u64,
+            _task_ids: &[u64],
+        ) -> crate::error::Result<JobPollResult> {
             let pending = self.pending.borrow_mut().drain(..).collect::<Vec<_>>();
             Ok(JobPollResult {
                 completed: pending
@@ -724,17 +725,14 @@ mod tests {
         // split-task path is exercised (source → process(MaxRows(3))).
         let mut graph2 = PipelineGraph::new();
         graph2
-            .add_linear(vec![
-                TaskDef::passthrough("source", |b| Ok(b)),
-                {
-                    let max_seen_clone = max_seen.clone();
-                    TaskDef::passthrough("process", move |b: RecordBatch| {
-                        max_seen_clone.fetch_max(b.num_rows(), Ordering::Relaxed);
-                        Ok(b)
-                    })
-                    .with_batch_mode(BatchMode::MaxRows(3))
-                },
-            ])
+            .add_linear(vec![TaskDef::passthrough("source", |b| Ok(b)), {
+                let max_seen_clone = max_seen.clone();
+                TaskDef::passthrough("process", move |b: RecordBatch| {
+                    max_seen_clone.fetch_max(b.num_rows(), Ordering::Relaxed);
+                    Ok(b)
+                })
+                .with_batch_mode(BatchMode::MaxRows(3))
+            }])
             .unwrap();
 
         let (mut executor, _tmp) = mock_executor(&graph2);
@@ -791,8 +789,7 @@ mod tests {
         let src = graph.add_task(TaskDef::passthrough("source", |b| Ok(b)));
         let a = graph.add_task(TaskDef::passthrough("sink_a", |b| Ok(b)));
         let b = graph.add_task(
-            TaskDef::passthrough("sink_b", |b| Ok(b))
-                .with_batch_mode(BatchMode::MaxRows(2)),
+            TaskDef::passthrough("sink_b", |b| Ok(b)).with_batch_mode(BatchMode::MaxRows(2)),
         );
         graph.add_edge(src, a).unwrap();
         graph.add_edge(src, b).unwrap();

@@ -68,7 +68,7 @@ impl SourceGenerator for DefaultGenerator {
 }
 
 /// Global counter for unique execution IDs.
-static NEXT_EXEC_ID: atomic::AtomicU64 =  atomic::AtomicU64::new(0);
+static NEXT_EXEC_ID: atomic::AtomicU64 = atomic::AtomicU64::new(0);
 
 /// Allocate a globally unique execution ID for a [`PathStep`].
 pub fn next_exec_id() -> u64 {

@@ -4,7 +4,9 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum RplError {
     /// Schema validation failure when connecting tasks.
-    #[error("schema mismatch: task '{provider_task}' does not provide fields {missing_fields:?} required by task '{consumer_task}'")]
+    #[error(
+        "schema mismatch: task '{provider_task}' does not provide fields {missing_fields:?} required by task '{consumer_task}'"
+    )]
     SchemaMismatch {
         provider_task: String,
         consumer_task: String,

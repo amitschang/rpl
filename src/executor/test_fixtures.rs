@@ -8,8 +8,8 @@ use crate::task::{BatchMode, TaskDef};
 use arrow::array::{Float64Array, Int64Array};
 use arrow::datatypes::{DataType, Schema};
 use arrow::record_batch::RecordBatch;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 // ---- Graph fixtures -------------------------------------------------------
 

@@ -36,14 +36,13 @@ use std::time::Duration;
 use arrow::array::{Float64Array, Int64Array};
 use arrow::datatypes::DataType;
 
-use rpl::{
-    BatchMode, DefaultGenerator, Executor, HqExecutor,
-    PipelineGraph, PipelineTracker, RecordBatchExt, TaskDef, TaskRegistry,
-    run_worker_if_invoked, schema_of,
-};
 use rpl::executor::local::LocalExecutor;
 use rpl::executor::threaded::ThreadExecutor;
 use rpl::task::Resources;
+use rpl::{
+    BatchMode, DefaultGenerator, Executor, HqExecutor, PipelineGraph, PipelineTracker,
+    RecordBatchExt, TaskDef, TaskRegistry, run_worker_if_invoked, schema_of,
+};
 
 // ---------------------------------------------------------------------------
 // Tunable parameters
@@ -83,7 +82,10 @@ fn build_graph() -> PipelineGraph {
             thread::sleep(Duration::from_millis(BRANCH_A_SLEEP_MS));
             Ok(batch)
         })
-        .with_resources(Resources { num_cpus: 1, ..Default::default() }),
+        .with_resources(Resources {
+            num_cpus: 1,
+            ..Default::default()
+        }),
     );
 
     // Branch B: passthrough. MaxRows(3) batching.
@@ -93,7 +95,10 @@ fn build_graph() -> PipelineGraph {
             Ok(batch)
         })
         .with_batch_mode(BatchMode::MaxRows(3))
-        .with_resources(Resources { num_cpus: 2, ..Default::default() }),
+        .with_resources(Resources {
+            num_cpus: 2,
+            ..Default::default()
+        }),
     );
 
     // Merge sink: passthrough.

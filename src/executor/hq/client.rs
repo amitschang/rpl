@@ -156,9 +156,7 @@ impl HqBackend for HqClient {
             serde_json::from_slice(&output.stdout)
                 .map_err(|e| RplError::Hq(format!("failed to parse hq task list output: {e}")))?;
 
-        let tasks = parsed
-            .remove(&job_id.to_string())
-            .unwrap_or_default();
+        let tasks = parsed.remove(&job_id.to_string()).unwrap_or_default();
 
         let mut completed = Vec::new();
         let mut running_ids = HashSet::new();
