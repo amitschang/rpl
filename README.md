@@ -44,6 +44,8 @@ executor backends. This means:
 
 - **`LocalExecutor`**: serial, single-threaded, in-process. Ideal for
   development and testing.
+- **`ThreadExecutor`**: multi-threaded execution within a single process, using
+  a thread pool. Good for CPU-bound tasks on a single machine.
 - **`HqExecutor`**: distributed execution via
   [HyperQueue](https://github.com/It4innovations/hyperqueue). Tasks run as jobs
   on a cluster.
@@ -76,6 +78,24 @@ counting). Built-in transports:
 `arrow`, `petgraph`, `serde`, `serde_json`, `uuid`, `tempfile`, `thiserror`. No
 async runtime, no RPC framework, no external services required for local use.
 
+### Utilities for column operations
+
+Common patterns like renaming, dropping, and passthrough transformations are
+provided as utilities, reducing boilerplate for simple common tasks on arrow
+record batches. Available via `RecordBatchExt` trait methods, including:
+
+- `append_column(name, array)`
+- `drop_column(name)`
+- `rename_column(old_name, new_name)`
+- `column_as::<T>(name) -> Result<&T>`
+
+### Utilities for execution tracking and reporting
+
+Per batch-task timing and lineage are available in `Output` metadata. The
+`PipelineTracker` utility aggregates this information across batches,
+deduplicating at fan-out points, to provide live progress reporting and a final
+execution summary.
+
 ## Example
 
 ### Defining and running a pipeline locally
@@ -83,21 +103,14 @@ async runtime, no RPC framework, no external services required for local use.
 ```rust
 use std::sync::Arc;
 use arrow::array::Float64Array;
-use arrow::datatypes::{DataType, Field, Schema};
+use arrow::datatypes::{DataType, Schema};
 use rpl::{
-    BatchMode, DefaultGenerator, Executor, PipelineGraph, TaskDef,
+    BatchMode, DefaultGenerator, Executor, PipelineGraph, RecordBatchExt, TaskDef,
     executor::local::LocalExecutor,
+    schema_of,
 };
 
 fn main() {
-    // Define schemas.
-    let value_schema = Schema::new(vec![
-        Field::new("value", DataType::Float64, true),
-    ]);
-    let scaled_schema = Schema::new(vec![
-        Field::new("scaled", DataType::Float64, true),
-    ]);
-
     // Build the pipeline graph.
     let mut graph = PipelineGraph::new();
     graph.add_linear(vec![
@@ -105,7 +118,7 @@ fn main() {
         TaskDef::new(
             "compute_value",
             Schema::empty(),
-            value_schema,
+            schema_of(&[("value", DataType::Float64)]),
             |batch| {
                 let len = batch.num_rows();
                 let values: Vec<f64> = (0..len).map(|i| i as f64 * 1.5).collect();
@@ -115,11 +128,10 @@ fn main() {
         // Second task: read `value`, produce `scaled`, accumulate in batches of 10.
         TaskDef::new(
             "scale",
-            Schema::new(vec![Field::new("value", DataType::Float64, true)]),
-            scaled_schema,
+            schema_of(&[("value", DataType::Float64)]),
+            schema_of(&[("scaled", DataType::Float64)]),
             |batch| {
-                let values = batch.column_by_name("value").unwrap();
-                let values = values.as_any().downcast_ref::<Float64Array>().unwrap();
+                let values = batch.column_as::<Float64Array>("value")?;
                 let scaled: Float64Array = values.iter()
                     .map(|v| v.map(|x| x * 2.0))
                     .collect();
