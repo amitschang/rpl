@@ -1,3 +1,10 @@
+//! Schema helpers and column-set tracking.
+//!
+//! Provides [`schema_of`] for concise schema construction from
+//! `(name, DataType)` pairs, and [`ColumnSet`] for tracking the set of
+//! available columns at each point in the pipeline graph during
+//! validation.
+
 use std::collections::HashMap;
 
 use arrow::datatypes::{DataType, Field, Schema};

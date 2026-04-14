@@ -1,3 +1,10 @@
+//! Error types for the `rpl` crate.
+//!
+//! All fallible operations return [`Result<T>`], an alias for
+//! `std::result::Result<T, RplError>`. [`RplError`] covers schema
+//! validation failures, graph structure errors, task execution failures,
+//! Arrow errors, I/O errors, and transport errors.
+
 use arrow::error::ArrowError;
 use thiserror::Error;
 

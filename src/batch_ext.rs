@@ -1,3 +1,9 @@
+//! Extension trait for Arrow [`RecordBatch`] column operations.
+//!
+//! The [`RecordBatchExt`] trait adds convenience methods for appending,
+//! dropping, replacing, renaming, and splitting columns without manually
+//! rebuilding the schema and column arrays each time.
+
 use std::sync::Arc;
 
 use arrow::array::Array;

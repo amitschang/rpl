@@ -1,3 +1,5 @@
+//! HyperQueue client for job submission and status polling.
+
 use std::cell::Cell;
 use std::collections::HashSet;
 use std::path::PathBuf;

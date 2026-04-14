@@ -1,3 +1,15 @@
+//! Pipeline DAG construction and schema validation.
+//!
+//! [`PipelineGraph`] stores tasks as nodes in a directed acyclic graph and
+//! the data-flow edges between them. Helper methods such as [`add_linear`]
+//! and [`add_fan_out`] build common topologies, while [`validate`] walks
+//! the graph in topological order to verify that every task's required
+//! columns are provided by its upstream producers.
+//!
+//! [`add_linear`]: PipelineGraph::add_linear
+//! [`add_fan_out`]: PipelineGraph::add_fan_out
+//! [`validate`]: PipelineGraph::validate
+
 use std::collections::HashMap;
 use std::fmt;
 

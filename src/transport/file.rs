@@ -1,3 +1,5 @@
+//! Arrow IPC file transport for shared-filesystem distributed execution.
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;

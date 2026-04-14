@@ -1,3 +1,9 @@
+//! Multi-threaded executor using a thread pool.
+//!
+//! [`ThreadExecutor`] fans out ready batches to worker threads while the
+//! main thread drives scheduling. Good for CPU-bound pipelines on a
+//! single machine.
+
 use std::collections::VecDeque;
 use std::sync::mpsc;
 use std::thread;

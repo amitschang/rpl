@@ -1,3 +1,9 @@
+//! Serial single-threaded executor.
+//!
+//! [`LocalExecutor`] runs all tasks in the current thread, processing one
+//! batch at a time. Useful for development, testing, and debugging since
+//! execution order is fully deterministic.
+
 use std::collections::VecDeque;
 use std::time::Instant;
 

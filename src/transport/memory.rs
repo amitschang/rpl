@@ -1,3 +1,5 @@
+//! In-memory transport for single-process execution.
+
 use std::collections::HashMap;
 use std::sync::Mutex;
 

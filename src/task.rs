@@ -1,3 +1,11 @@
+//! Task definition and batch mode configuration.
+//!
+//! A [`TaskDef`] pairs an execution function with schema contracts
+//! (required inputs, produced outputs, dropped columns) and an optional
+//! [`BatchMode`] that controls how incoming batches are accumulated
+//! before execution. Tasks may also carry optional [`Resources`]
+//! requests for executor-level scheduling.
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

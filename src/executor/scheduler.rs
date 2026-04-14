@@ -1,3 +1,10 @@
+//! Backend-agnostic batch scheduler.
+//!
+//! [`BatchScheduler`] manages per-task queues, origin tracking, batch
+//! accumulation, and flush semantics. It is generic over the data
+//! transport and shared by all executor backends so that local and
+//! distributed runs use identical scheduling logic.
+
 use std::collections::{BTreeSet, HashMap, VecDeque};
 
 use arrow::compute::concat_batches;

@@ -1,3 +1,17 @@
+//! Executor backends and shared scheduling infrastructure.
+//!
+//! This module defines the [`Executor`] trait, the [`SourceGenerator`]
+//! trait for feeding seed data into source tasks, and shared types such
+//! as [`OutputBatch`] and [`BatchLineage`]. The [`scheduler`] submodule
+//! contains the backend-agnostic [`BatchScheduler`](scheduler::BatchScheduler)
+//! used by all executor implementations.
+//!
+//! Executor backends:
+//!
+//! - [`local::LocalExecutor`] — single-threaded, in-process.
+//! - [`threaded::ThreadExecutor`] — multi-threaded with a thread pool.
+//! - [`hq::HqExecutor`] — distributed via HyperQueue.
+
 pub mod hq;
 pub mod local;
 pub mod scheduler;

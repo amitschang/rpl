@@ -1,3 +1,10 @@
+//! Distributed execution via [HyperQueue](https://github.com/It4innovations/hyperqueue).
+//!
+//! The current binary acts as both the driver and the worker. The driver
+//! submits tasks as HyperQueue jobs, and workers are launched by invoking
+//! the same binary with `--rpl-worker`. Use [`run_worker_if_invoked`] at
+//! the top of `main` to handle the worker entry point.
+
 pub mod client;
 pub mod worker;
 

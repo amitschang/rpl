@@ -1,3 +1,10 @@
+//! Task registry for driver/worker coordination.
+//!
+//! [`TaskRegistry`] maps task names to cloneable [`TaskDef`] instances so
+//! that remote executors can locate the same task definitions in both the
+//! driver (graph construction) and worker (execution) paths of a single
+//! binary.
+
 use std::collections::HashMap;
 
 use crate::error::{Result, RplError};

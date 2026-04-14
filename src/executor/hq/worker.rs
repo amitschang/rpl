@@ -1,3 +1,5 @@
+//! Worker-side entry point for HyperQueue task execution.
+
 use std::collections::BTreeSet;
 use std::time::Instant;
 

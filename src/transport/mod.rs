@@ -1,3 +1,14 @@
+//! Pluggable data transport for moving batches between tasks.
+//!
+//! The [`DataTransport`] trait abstracts batch storage with explicit
+//! lifecycle management (store, load, release, fan-out reference
+//! counting). Built-in implementations:
+//!
+//! - [`memory::InMemoryTransport`] — in-process storage for local execution.
+//! - [`file::FileTransport`] — Arrow IPC files on a shared filesystem.
+//! - [`dispatch::AnyTransport`] — runtime-dispatched variant for
+//!   configuration-driven selection.
+
 pub mod dispatch;
 pub mod file;
 pub mod memory;
