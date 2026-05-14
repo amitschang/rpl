@@ -40,6 +40,9 @@ pub enum RplError {
     /// HyperQueue error.
     #[error("hyperqueue error: {0}")]
     Hq(String),
+    /// Worker process error.
+    #[error("worker error: {0}")]
+    Worker(String),
 }
 
 pub type Result<T> = std::result::Result<T, RplError>;

@@ -106,9 +106,8 @@ pub mod transport;
 
 pub use batch_ext::RecordBatchExt;
 pub use error::{Result, RplError};
-pub use executor::hq::{
-    HqBackend, HqClient, HqExecutor, run_worker_if_invoked, run_worker_if_invoked_with,
-};
+pub use executor::hq::{HqBackend, HqClient, HqExecutor};
+pub use executor::worker::{run_worker_if_invoked, run_worker_if_invoked_with};
 pub use executor::{
     BatchLineage, DefaultGenerator, Executor, OutputBatch, PathStep, SourceGenerator,
 };

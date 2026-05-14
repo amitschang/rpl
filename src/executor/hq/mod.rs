@@ -6,10 +6,9 @@
 //! the top of `main` to handle the worker entry point.
 
 pub mod client;
-pub mod worker;
 
 pub use client::{HqBackend, HqClient};
-pub use worker::{run_worker_if_invoked, run_worker_if_invoked_with};
+pub use super::worker::{run_worker_if_invoked, run_worker_if_invoked_with};
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::PathBuf;
@@ -596,7 +595,8 @@ impl<B: HqBackend, T: DataTransport> Iterator for HqIter<'_, B, T> {
 mod tests {
     use super::*;
     use crate::executor::test_fixtures::{self, BigSource};
-    use crate::executor::{DefaultGenerator, Executor, SourceGenerator};
+    use crate::executor::worker::run_worker;
+use crate::executor::{DefaultGenerator, Executor, SourceGenerator};
     use crate::graph::PipelineGraph;
     use crate::registry::TaskRegistry;
     use crate::schema::schema_of;
@@ -646,7 +646,7 @@ mod tests {
             _resources: &crate::task::Resources,
         ) -> crate::error::Result<u64> {
             // Run the worker logic inline using the shared transport.
-            worker::run_worker(command, &self.registry, &*self.transport)?;
+            run_worker(command, &self.registry, &*self.transport)?;
 
             let id = self.next_task_id.get();
             self.next_task_id.set(id + 1);

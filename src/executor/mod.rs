@@ -16,6 +16,7 @@ pub mod hq;
 pub mod local;
 pub mod scheduler;
 pub mod threaded;
+pub mod worker;
 
 #[cfg(test)]
 pub(crate) mod test_fixtures;
