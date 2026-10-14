@@ -105,7 +105,7 @@ impl Executor for ThreadExecutor {
 /// Result sent back from a worker thread after executing a task chunk.
 struct CompletedChunk {
     node: NodeIndex,
-    output: Result<RecordBatch>,
+    output: Result<Vec<RecordBatch>>,
     lineage: BatchLineage,
     task_name: String,
     is_sink: bool,
@@ -264,8 +264,8 @@ impl ThreadedIter<'_> {
     /// Process a completed chunk: build lineage and either buffer as sink
     /// output or deliver to downstream tasks via the scheduler.
     fn process_chunk(&mut self, chunk: CompletedChunk) {
-        let output = match chunk.output {
-            Ok(batch) => batch,
+        let outputs = match chunk.output {
+            Ok(batches) => batches,
             Err(e) => {
                 self.pending_outputs.push_back(Err(e));
                 return;
@@ -281,26 +281,31 @@ impl ThreadedIter<'_> {
         let mut lineage = chunk.lineage;
         lineage.path.push(step);
 
-        let num_rows = output.num_rows();
-
         if chunk.is_sink {
-            self.pending_outputs.push_back(Ok(OutputBatch {
-                data: output,
-                task: chunk.task_name,
-                lineage,
-            }));
+            for output in outputs {
+                self.pending_outputs.push_back(Ok(OutputBatch {
+                    data: output,
+                    task: chunk.task_name.clone(),
+                    lineage: lineage.clone(),
+                }));
+            }
         } else {
-            let handle = match self.scheduler.transport().store(&output) {
-                Ok(h) => h,
-                Err(e) => {
-                    self.pending_outputs.push_back(Err(e));
-                    self.done = true;
-                    return;
-                }
-            };
+            let mut stream_outputs = Vec::with_capacity(outputs.len());
+            for output in outputs {
+                let num_rows = output.num_rows();
+                let handle = match self.scheduler.transport().store(&output) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        self.pending_outputs.push_back(Err(e));
+                        self.done = true;
+                        return;
+                    }
+                };
+                stream_outputs.push((handle, num_rows));
+            }
             if let Err(e) = self
                 .scheduler
-                .deliver_output(chunk.node, handle, lineage, num_rows)
+                .deliver_stream_outputs(chunk.node, stream_outputs, lineage)
             {
                 self.pending_outputs.push_back(Err(e));
                 self.done = true;

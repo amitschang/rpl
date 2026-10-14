@@ -26,6 +26,12 @@
 //!   sharing the same origin set before executing (barrier for diamond-shaped
 //!   graphs).
 //!
+//! # Multi-stream outputs
+//!
+//! A task can produce multiple output streams, each routed to different
+//! successors via stream-annotated edges. The graph validates that every stream
+//! is wired and that sink tasks produce exactly one stream.
+//!
 //! # Executors
 //!
 //! The [`executor::scheduler::BatchScheduler`] manages queues, origin tracking,

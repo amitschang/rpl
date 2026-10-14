@@ -153,6 +153,7 @@ mod tests {
             num_rows: 3,
             origins: BTreeSet::from([0, 1]),
             exec_duration_ms: Some(42),
+            stream: 0,
         }];
 
         transport.publish_output(&token, &entries).unwrap();

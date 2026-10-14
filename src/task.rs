@@ -19,10 +19,10 @@ use crate::error::Result;
 /// Implemented by [`TaskNodeImpl`] to hide the concrete config type `C`,
 /// allowing heterogeneous tasks to be stored in a single graph.
 pub(crate) trait TaskNode: Send + Sync {
-    fn execute(&self, batch: RecordBatch) -> Result<RecordBatch>;
+    fn execute(&self, batch: RecordBatch) -> Result<Vec<RecordBatch>>;
 }
 
-type TaskFn<C> = Box<dyn Fn(RecordBatch, &C) -> Result<RecordBatch> + Send + Sync>;
+type TaskFn<C> = Box<dyn Fn(RecordBatch, &C) -> Result<Vec<RecordBatch>> + Send + Sync>;
 
 /// Generic task implementation holding a function and its config.
 ///
@@ -33,7 +33,7 @@ struct TaskNodeImpl<C: Send + Sync + 'static> {
 }
 
 impl<C: Send + Sync + 'static> TaskNode for TaskNodeImpl<C> {
-    fn execute(&self, batch: RecordBatch) -> Result<RecordBatch> {
+    fn execute(&self, batch: RecordBatch) -> Result<Vec<RecordBatch>> {
         (self.func)(batch, &self.config)
     }
 }
@@ -91,7 +91,9 @@ pub struct TaskDef {
     pub name: String,
     node: Arc<dyn TaskNode>,
     requires: Schema,
-    produces: Schema,
+    /// Per-stream output schemas. Index = stream number.
+    /// Single-stream tasks have exactly one entry.
+    produces: Vec<Schema>,
     drops: Vec<String>,
     pub resources: Resources,
 
@@ -99,7 +101,8 @@ pub struct TaskDef {
 }
 
 impl TaskDef {
-    /// Create a task with no config.
+    /// Create a task with no config producing a single output stream
+    /// (implicitly stream 0).
     ///
     /// ```ignore
     /// use arrow::datatypes::Schema;
@@ -109,6 +112,38 @@ impl TaskDef {
     where
         F: Fn(RecordBatch) -> Result<RecordBatch> + Send + Sync + 'static,
     {
+        TaskDef {
+            name: name.into(),
+            node: Arc::new(TaskNodeImpl {
+                func: Box::new(move |batch, _: &()| func(batch).map(|b| vec![b])),
+                config: (),
+            }),
+            requires,
+            produces: vec![produces],
+            drops: Vec::new(),
+            resources: Resources {
+                num_cpus: 1,
+                ..Default::default()
+            },
+            batch_mode: BatchMode::default(),
+        }
+    }
+
+    /// Create a multi-stream task with no config.
+    ///
+    /// The function receives a single input batch and returns one
+    /// `RecordBatch` per output stream. The length of the returned
+    /// `Vec` must equal `produces.len()`.
+    pub fn new_multi_stream<F>(
+        name: impl Into<String>,
+        requires: Schema,
+        produces: Vec<Schema>,
+        func: F,
+    ) -> Self
+    where
+        F: Fn(RecordBatch) -> Result<Vec<RecordBatch>> + Send + Sync + 'static,
+    {
+        assert!(!produces.is_empty(), "produces must have at least one stream");
         TaskDef {
             name: name.into(),
             node: Arc::new(TaskNodeImpl {
@@ -126,7 +161,8 @@ impl TaskDef {
         }
     }
 
-    /// Create a task with typed configuration.
+    /// Create a task with typed configuration producing a single output stream
+    /// (implicitly stream 0).
     ///
     /// ```ignore
     /// let task = TaskDef::new_with_config(
@@ -151,7 +187,47 @@ impl TaskDef {
         TaskDef {
             name: name.into(),
             node: Arc::new(TaskNodeImpl {
-                func: Box::new(func),
+                func: Box::new(move |batch, cfg| func(batch, cfg).map(|b| vec![b])),
+                config,
+            }),
+            requires,
+            produces: vec![produces],
+            drops: Vec::new(),
+            resources: Resources {
+                num_cpus: 1,
+                ..Default::default()
+            },
+            batch_mode: BatchMode::default(),
+        }
+    }
+
+    /// Create a multi-stream task with typed configuration.
+    ///
+    /// ```ignore
+    /// let task = TaskDef::new_multi_stream_with_config(
+    ///     "split",
+    ///     requires_schema,
+    ///     vec![stream0_schema, stream1_schema],
+    ///     |batch, cfg: &MyConfig| Ok(vec![batch.clone(), batch]),
+    ///     MyConfig { factor: 2.0 },
+    /// );
+    /// ```
+    pub fn new_multi_stream_with_config<C, F>(
+        name: impl Into<String>,
+        requires: Schema,
+        produces: Vec<Schema>,
+        func: F,
+        config: C,
+    ) -> Self
+    where
+        C: Send + Sync + 'static,
+        F: Fn(RecordBatch, &C) -> Result<Vec<RecordBatch>> + Send + Sync + 'static,
+    {
+        assert!(!produces.is_empty(), "produces must have at least one stream");
+        TaskDef {
+            name: name.into(),
+            node: Arc::new(TaskNodeImpl {
+                func: Box::new(move |batch, cfg| func(batch, cfg)),
                 config,
             }),
             requires,
@@ -171,6 +247,20 @@ impl TaskDef {
         func: impl Fn(RecordBatch) -> Result<RecordBatch> + Send + Sync + 'static,
     ) -> Self {
         Self::new(name, Schema::empty(), Schema::empty(), func)
+    }
+
+    /// Convenience constructor for a multi-stream passthrough task.
+    pub fn passthrough_multi_stream(
+        name: impl Into<String>,
+        num_streams: usize,
+        func: impl Fn(RecordBatch) -> Result<Vec<RecordBatch>> + Send + Sync + 'static,
+    ) -> Self {
+        Self::new_multi_stream(
+            name,
+            Schema::empty(),
+            vec![Schema::empty(); num_streams],
+            func,
+        )
     }
 
     /// Set columns this task removes from the batch.
@@ -207,8 +297,8 @@ impl TaskDef {
         self
     }
 
-    /// Execute this task on a RecordBatch.
-    pub fn execute(&self, batch: RecordBatch) -> Result<RecordBatch> {
+    /// Execute this task on a RecordBatch, returning one batch per output stream.
+    pub fn execute(&self, batch: RecordBatch) -> Result<Vec<RecordBatch>> {
         self.node.execute(batch)
     }
 
@@ -217,9 +307,14 @@ impl TaskDef {
         &self.requires
     }
 
-    /// New columns this task adds to the batch.
-    pub fn produces(&self) -> &Schema {
+    /// Per-stream output schemas. Index = stream number.
+    pub fn produces(&self) -> &[Schema] {
         &self.produces
+    }
+
+    /// Number of output streams this task produces.
+    pub fn num_output_streams(&self) -> usize {
+        self.produces.len()
     }
 
     /// Columns this task removes from the batch.

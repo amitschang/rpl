@@ -66,8 +66,8 @@ pub struct BatchScheduler<T: DataTransport> {
     sink_indices: Vec<NodeIndex>,
     /// The batch mode for each node.
     batch_modes: HashMap<NodeIndex, BatchMode>,
-    /// Successor lists per node.
-    successors: HashMap<NodeIndex, Vec<NodeIndex>>,
+    /// Per-stream successor mapping: (from_node, stream) -> list of target nodes.
+    stream_successors: HashMap<(NodeIndex, u32), Vec<NodeIndex>>,
 
     // --- Queues ---
     /// Input queues for non-CommonOrigin nodes.
@@ -96,14 +96,24 @@ impl<T: DataTransport> BatchScheduler<T> {
         let sink_indices = graph.sink_tasks();
 
         let mut batch_modes = HashMap::new();
-        let mut successors_map = HashMap::new();
+        let mut stream_successors: HashMap<(NodeIndex, u32), Vec<NodeIndex>> = HashMap::new();
         let mut queues = HashMap::new();
         let mut origin_queues = HashMap::new();
 
         for node in graph.node_indices() {
             let task = graph.task(node);
             batch_modes.insert(node, task.batch_mode.clone());
-            successors_map.insert(node, graph.successors(node));
+
+            // Build per-stream successor map from edges.
+            for (target, streams) in graph.successors_with_streams(node) {
+                for stream in streams {
+                    stream_successors
+                        .entry((node, stream))
+                        .or_default()
+                        .push(target);
+                }
+            }
+
             let preds = graph.predecessors(node);
 
             match &task.batch_mode {
@@ -131,7 +141,7 @@ impl<T: DataTransport> BatchScheduler<T> {
             source_indices,
             sink_indices,
             batch_modes,
-            successors: successors_map,
+            stream_successors,
             queues,
             origin_queues,
             next_origin: 0,
@@ -439,18 +449,18 @@ impl<T: DataTransport> BatchScheduler<T> {
         })
     }
 
-    /// Route a task's output to its successors.
+    /// Route a single stream's output to the successors that receive that stream.
     ///
-    /// Call this after executing a task and storing the result.
-    /// Handles fan-out by adding consumers to the transport.
-    pub fn deliver_output(
+    /// `stream` is the output stream index. Only successors connected to
+    /// `from` on this stream will receive the handle.
+    pub fn deliver_stream_output(
         &mut self,
         from: NodeIndex,
+        stream: u32,
         handle: T::Handle,
         lineage: BatchLineage,
         num_rows: usize,
     ) -> Result<()> {
-        let succs = self.successors[&from].clone();
         let is_sink = self.sink_indices.contains(&from);
 
         if is_sink {
@@ -463,11 +473,17 @@ impl<T: DataTransport> BatchScheduler<T> {
             return Ok(());
         }
 
-        if succs.is_empty() {
-            // No successors and not tracked as sink — release.
-            self.transport.release(&handle)?;
-            return Ok(());
-        }
+        let succs = self
+            .stream_successors
+            .get(&(from, stream))
+            .cloned()
+            .unwrap_or_default();
+
+        debug_assert!(
+            !succs.is_empty(),
+            "deliver_stream_output called for node {from:?} stream {stream} with no successors; \
+             graph validation should prevent this"
+        );
 
         // Register additional consumers for fan-out.
         let additional = succs.len().saturating_sub(1);
@@ -487,11 +503,28 @@ impl<T: DataTransport> BatchScheduler<T> {
         Ok(())
     }
 
+    /// Route a multi-stream task's outputs to their respective successors.
+    ///
+    /// `outputs` is indexed by stream number: `outputs[i]` is `(handle, num_rows)`
+    /// for stream `i`. Each stream's output is delivered only to successors
+    /// connected on that stream.
+    pub fn deliver_stream_outputs(
+        &mut self,
+        from: NodeIndex,
+        outputs: Vec<(T::Handle, usize)>,
+        lineage: BatchLineage,
+    ) -> Result<()> {
+        for (stream, (handle, num_rows)) in outputs.into_iter().enumerate() {
+            self.deliver_stream_output(from, stream as u32, handle, lineage.clone(), num_rows)?;
+        }
+        Ok(())
+    }
+
     /// Route a task's output to a single specific successor.
     ///
-    /// Unlike [`deliver_output`](Self::deliver_output), this does not handle
-    /// fan-out or ref counting — the caller is responsible for managing
-    /// transport consumers when delivering to multiple successors individually.
+    /// Does not handle fan-out or ref counting — the caller is responsible
+    /// for managing transport consumers when delivering to multiple
+    /// successors individually.
     pub fn deliver_to_successor(
         &mut self,
         from: NodeIndex,
@@ -508,11 +541,10 @@ impl<T: DataTransport> BatchScheduler<T> {
         self.enqueue_to_node(to, Some(from), tagged);
     }
 
-    /// Successor node indices for a given node.
-    pub fn successors_of(&self, node: NodeIndex) -> &[NodeIndex] {
-        // Return slice from the stored Vec.
-        self.successors
-            .get(&node)
+    /// Successor node indices for a given node and stream.
+    pub fn stream_successors_of(&self, node: NodeIndex, stream: u32) -> &[NodeIndex] {
+        self.stream_successors
+            .get(&(node, stream))
             .map(|v| v.as_slice())
             .unwrap_or(&[])
     }
@@ -591,6 +623,129 @@ mod tests {
         RecordBatch::try_new(schema, vec![Arc::new(Int64Array::from(vec![id]))]).unwrap()
     }
 
+    /// Result of a single step in the TestExecutor.
+    #[derive(Debug)]
+    #[allow(dead_code)]
+    struct StepResult {
+        node: NodeIndex,
+        lineage: BatchLineage,
+        /// Number of input handles the task received.
+        input_handles: usize,
+        /// Number of output rows per stream.
+        output_rows: Vec<usize>,
+    }
+
+    /// Minimal executor that drives a BatchScheduler for testing.
+    ///
+    /// Handles single-stream and multi-stream tasks, load/concat/store/deliver.
+    /// Tests can use `step()` for fine-grained control or `run_to_idle()` for
+    /// outcome-focused assertions.
+    struct TestExecutor {
+        sched: BatchScheduler<InMemoryTransport>,
+        graph: PipelineGraph,
+        /// History of all steps executed.
+        history: Vec<StepResult>,
+    }
+
+    impl TestExecutor {
+        fn new(graph: PipelineGraph) -> Self {
+            let transport = InMemoryTransport::new();
+            let sched = BatchScheduler::new(&graph, transport);
+            TestExecutor {
+                sched,
+                graph,
+                history: Vec::new(),
+            }
+        }
+
+        fn enqueue(&mut self, batch: &RecordBatch) {
+            self.sched.enqueue_source_batch(batch).unwrap();
+        }
+
+        /// Execute the next ready task. Returns None if no task is ready.
+        fn step(&mut self) -> Option<&StepResult> {
+            let ready = self.sched.next_ready_task()?;
+            let node = ready.node;
+            let input_handles = ready.handles.len();
+            let lineage = ready.lineage.clone();
+
+            let input_batch = self.sched.load_and_concat(&ready.handles).unwrap();
+            self.sched.release_handles(&ready.handles).unwrap();
+
+            let task = self.graph.task(node);
+            let outputs = task.execute(input_batch).unwrap();
+
+            let output_rows: Vec<usize> = outputs.iter().map(|b| b.num_rows()).collect();
+
+            if outputs.len() == 1 {
+                let handle = self.sched.transport().store(&outputs[0]).unwrap();
+                self.sched
+                    .deliver_stream_output(node, 0, handle, lineage.clone(), outputs[0].num_rows())
+                    .unwrap();
+            } else {
+                let stored: Vec<(_, usize)> = outputs
+                    .iter()
+                    .map(|b| (self.sched.transport().store(b).unwrap(), b.num_rows()))
+                    .collect();
+                self.sched
+                    .deliver_stream_outputs(node, stored, lineage.clone())
+                    .unwrap();
+            }
+
+            self.history.push(StepResult {
+                node,
+                lineage,
+                input_handles,
+                output_rows,
+            });
+            self.history.last()
+        }
+
+        /// Drive the scheduler until no tasks are ready.
+        fn run_to_idle(&mut self) {
+            while self.step().is_some() {}
+        }
+
+        /// Drive until `target` fires, returning its StepResult index.
+        /// Panics if the scheduler goes idle without `target` firing.
+        fn run_until(&mut self, target: NodeIndex) -> &StepResult {
+            for _ in 0..100 {
+                match self.step() {
+                    Some(result) if result.node == target => {
+                        return self.history.last().unwrap();
+                    }
+                    Some(_) => continue,
+                    None => panic!("scheduler went idle before node {target:?} fired"),
+                }
+            }
+            panic!("exceeded iteration limit waiting for node {target:?}");
+        }
+
+        /// All firings of a given node.
+        fn firings_of(&self, node: NodeIndex) -> Vec<&StepResult> {
+            self.history.iter().filter(|r| r.node == node).collect()
+        }
+
+        fn mark_flush(&mut self) {
+            self.sched.mark_flush();
+        }
+
+        #[allow(dead_code)]
+        fn is_idle(&self) -> bool {
+            self.sched.is_idle()
+        }
+
+        #[allow(dead_code)]
+        fn scheduler(&self) -> &BatchScheduler<InMemoryTransport> {
+            &self.sched
+        }
+
+        #[allow(dead_code)]
+        fn scheduler_mut(&mut self) -> &mut BatchScheduler<InMemoryTransport> {
+            &mut self.sched
+        }
+    }
+
     #[test]
     fn maxrows_threshold() {
         // Linear: source -> task(MaxRows(3)) -> sink
@@ -604,52 +759,27 @@ mod tests {
             .unwrap();
         graph.validate(&DefaultGenerator::new()).unwrap();
 
-        let transport = InMemoryTransport::new();
-        let mut sched = BatchScheduler::new(&graph, transport);
+        let mut exec = TestExecutor::new(graph);
 
-        // Enqueue 2 batches — should not be ready (need 3 rows).
-        sched.enqueue_source_batch(&make_batch(0)).unwrap();
-        sched.enqueue_source_batch(&make_batch(1)).unwrap();
+        // Enqueue 2 batches — after processing sources, accumulate should not fire (need 3 rows).
+        exec.enqueue(&make_batch(0));
+        exec.enqueue(&make_batch(1));
 
-        // Source node (MaxRows(1)) should be ready.
-        let ready = sched.next_ready_task().unwrap();
-        // Process source — just pass through and deliver.
-        let batch = sched.load_and_concat(&ready.handles).unwrap();
-        sched.release_handles(&ready.handles).unwrap();
-        let handle = sched.transport().store(&batch).unwrap();
-        sched
-            .deliver_output(ready.node, handle, ready.lineage, batch.num_rows())
-            .unwrap();
-
-        // Process second source batch.
-        let ready = sched.next_ready_task().unwrap();
-        let batch = sched.load_and_concat(&ready.handles).unwrap();
-        sched.release_handles(&ready.handles).unwrap();
-        let handle = sched.transport().store(&batch).unwrap();
-        sched
-            .deliver_output(ready.node, handle, ready.lineage, batch.num_rows())
-            .unwrap();
+        // Process both source firings.
+        exec.step().unwrap();
+        exec.step().unwrap();
 
         // Accumulate node should NOT be ready yet (2 rows < 3).
-        // Next ready should be None (sink has nothing, accumulate not ready).
-        assert!(sched.next_ready_task().is_none());
+        assert!(exec.step().is_none());
 
-        // Enqueue 3rd source batch.
-        sched.enqueue_source_batch(&make_batch(2)).unwrap();
-        let ready = sched.next_ready_task().unwrap();
-        let batch = sched.load_and_concat(&ready.handles).unwrap();
-        sched.release_handles(&ready.handles).unwrap();
-        let handle = sched.transport().store(&batch).unwrap();
-        sched
-            .deliver_output(ready.node, handle, ready.lineage, batch.num_rows())
-            .unwrap();
+        // Enqueue 3rd source batch and process it.
+        exec.enqueue(&make_batch(2));
+        exec.step().unwrap();
 
         // Now accumulate should be ready with 3 rows.
-        let ready = sched.next_ready_task().unwrap();
-        assert_eq!(ready.handles.len(), 3);
-        let batch = sched.load_and_concat(&ready.handles).unwrap();
-        assert_eq!(batch.num_rows(), 3);
-        assert_eq!(ready.lineage.origins, BTreeSet::from([0, 1, 2]));
+        let result = exec.step().unwrap();
+        assert_eq!(result.input_handles, 3);
+        assert_eq!(result.lineage.origins, BTreeSet::from([0, 1, 2]));
     }
 
     #[test]
@@ -664,28 +794,21 @@ mod tests {
             .unwrap();
         graph.validate(&DefaultGenerator::new()).unwrap();
 
-        let transport = InMemoryTransport::new();
-        let mut sched = BatchScheduler::new(&graph, transport);
+        let mut exec = TestExecutor::new(graph);
 
         // Enqueue 2 batches and process sources.
-        for i in 0..2 {
-            sched.enqueue_source_batch(&make_batch(i)).unwrap();
-            let ready = sched.next_ready_task().unwrap();
-            let batch = sched.load_and_concat(&ready.handles).unwrap();
-            sched.release_handles(&ready.handles).unwrap();
-            let handle = sched.transport().store(&batch).unwrap();
-            sched
-                .deliver_output(ready.node, handle, ready.lineage, batch.num_rows())
-                .unwrap();
-        }
+        exec.enqueue(&make_batch(0));
+        exec.enqueue(&make_batch(1));
+        exec.step().unwrap();
+        exec.step().unwrap();
 
         // Accumulate not ready (2 < 5).
-        assert!(sched.next_ready_task().is_none());
+        assert!(exec.step().is_none());
 
         // Flush mode — should drain partial.
-        sched.mark_flush();
-        let ready = sched.next_ready_task().unwrap();
-        assert_eq!(ready.handles.len(), 2);
+        exec.mark_flush();
+        let result = exec.step().unwrap();
+        assert_eq!(result.input_handles, 2);
     }
 
     #[test]
@@ -705,49 +828,22 @@ mod tests {
         graph.add_edge(c, d).unwrap();
         graph.validate(&DefaultGenerator::new()).unwrap();
 
-        let transport = InMemoryTransport::new();
-        let mut sched = BatchScheduler::new(&graph, transport);
+        let mut exec = TestExecutor::new(graph);
+        exec.enqueue(&make_batch(0));
 
-        // Enqueue source batch.
-        sched.enqueue_source_batch(&make_batch(0)).unwrap();
+        // Process A.
+        exec.step().unwrap();
+        // Process B or C (one branch).
+        exec.step().unwrap();
+        // D should NOT be ready yet — process the other branch.
+        let result = exec.step().unwrap();
+        assert_ne!(result.node, d);
 
-        // Process A (source).
-        let ready = sched.next_ready_task().unwrap();
-        let batch = sched.load_and_concat(&ready.handles).unwrap();
-        sched.release_handles(&ready.handles).unwrap();
-        let handle = sched.transport().store(&batch).unwrap();
-        sched
-            .deliver_output(ready.node, handle, ready.lineage, batch.num_rows())
-            .unwrap();
-
-        // D should NOT be ready yet (only one predecessor has delivered).
-        // Should get B or C next.
-        let ready = sched.next_ready_task().unwrap();
-        let first_name = if ready.node == b { "B" } else { "C" };
-        let batch = sched.load_and_concat(&ready.handles).unwrap();
-        sched.release_handles(&ready.handles).unwrap();
-        let handle = sched.transport().store(&batch).unwrap();
-        sched
-            .deliver_output(ready.node, handle, ready.lineage, batch.num_rows())
-            .unwrap();
-
-        // D still not ready (missing one predecessor).
-        // Should get the other branch.
-        let ready = sched.next_ready_task().unwrap();
-        let second_name = if ready.node == b { "B" } else { "C" };
-        assert_ne!(first_name, second_name);
-        let batch = sched.load_and_concat(&ready.handles).unwrap();
-        sched.release_handles(&ready.handles).unwrap();
-        let handle = sched.transport().store(&batch).unwrap();
-        sched
-            .deliver_output(ready.node, handle, ready.lineage, batch.num_rows())
-            .unwrap();
-
-        // Now D should be ready with contributions from both B and C.
-        let ready = sched.next_ready_task().unwrap();
-        assert_eq!(ready.node, d);
-        assert_eq!(ready.handles.len(), 2);
-        assert_eq!(ready.lineage.origins, BTreeSet::from([0]));
+        // Now D should fire with contributions from both B and C.
+        let result = exec.step().unwrap();
+        assert_eq!(result.node, d);
+        assert_eq!(result.input_handles, 2);
+        assert_eq!(result.lineage.origins, BTreeSet::from([0]));
     }
 
     #[test]
@@ -756,136 +852,59 @@ mod tests {
         // A -> C                  -> D
         //
         // With 2 source batches (origins 0, 1):
-        //   B0 merges origins {0,1} into one batch -> B processes -> D gets b_{0+1} from pred B
-        //   C processes origin 0 -> D gets c_0 from pred C
-        //   C processes origin 1 -> D gets c_1 from pred C
-        //   D should fire: b_{0+1} (origins={0,1}) matched with c_0+c_1 (each covering one origin).
-
+        //   B0 merges origins {0,1} into one batch -> B processes -> D gets from pred B
+        //   C processes each origin -> D gets from pred C
+        //   D should fire matching all origins.
         let mut graph = PipelineGraph::new();
-        let a = graph.add_task(TaskDef::passthrough("A", |b| Ok(b)));
-        let b0 = graph.add_task(TaskDef::passthrough("B0", |b| Ok(b)).with_batch_size(2));
-        let b = graph.add_task(TaskDef::passthrough("B", |b| Ok(b)));
-        let c = graph.add_task(TaskDef::passthrough("C", |b| Ok(b)));
+        let _a = graph.add_task(TaskDef::passthrough("A", |b| Ok(b)));
+        let _b0 = graph.add_task(TaskDef::passthrough("B0", |b| Ok(b)).with_batch_size(2));
+        let _b = graph.add_task(TaskDef::passthrough("B", |b| Ok(b)));
+        let _c = graph.add_task(TaskDef::passthrough("C", |b| Ok(b)));
         let d = graph.add_task(
             TaskDef::passthrough("D", |b| Ok(b)).with_batch_mode(BatchMode::CommonOrigin),
         );
-        graph.add_edge(a, b0).unwrap();
-        graph.add_edge(b0, b).unwrap();
-        graph.add_edge(a, c).unwrap();
-        graph.add_edge(b, d).unwrap();
-        graph.add_edge(c, d).unwrap();
+        graph.add_edge(_a, _b0).unwrap();
+        graph.add_edge(_b0, _b).unwrap();
+        graph.add_edge(_a, _c).unwrap();
+        graph.add_edge(_b, d).unwrap();
+        graph.add_edge(_c, d).unwrap();
         graph.validate(&DefaultGenerator::new()).unwrap();
 
-        let transport = InMemoryTransport::new();
-        let mut sched = BatchScheduler::new(&graph, transport);
+        let mut exec = TestExecutor::new(graph);
+        exec.enqueue(&make_batch(0));
+        exec.enqueue(&make_batch(1));
+        exec.mark_flush(); // allow B0 to fire with 2 rows.
 
-        // Helper: process all ready non-D tasks until nothing else fires.
-        fn process_non_target<T: DataTransport>(
-            sched: &mut BatchScheduler<T>,
-            target: NodeIndex,
-        ) -> bool {
-            let mut did_work = false;
-            loop {
-                let ready = match sched.next_ready_task() {
-                    Some(r) if r.node != target => r,
-                    Some(r) => {
-                        // Put handles back — not a great API but for test purposes,
-                        // we re-enqueue. Instead, let's just check after processing everything.
-                        // Actually, we can't un-pop. Let's just process target too and break.
-                        let batch = sched.load_and_concat(&r.handles).unwrap();
-                        sched.release_handles(&r.handles).unwrap();
-                        let handle = sched.transport().store(&batch).unwrap();
-                        sched
-                            .deliver_output(r.node, handle, r.lineage, batch.num_rows())
-                            .unwrap();
-                        return true;
-                    }
-                    None => break,
-                };
-                let batch = sched.load_and_concat(&ready.handles).unwrap();
-                sched.release_handles(&ready.handles).unwrap();
-                let handle = sched.transport().store(&batch).unwrap();
-                sched
-                    .deliver_output(ready.node, handle, ready.lineage, batch.num_rows())
-                    .unwrap();
-                did_work = true;
-            }
-            did_work
-        }
-
-        // Enqueue 2 source batches.
-        sched.enqueue_source_batch(&make_batch(0)).unwrap();
-        sched.enqueue_source_batch(&make_batch(1)).unwrap();
-
-        // Process everything until D fires.
-        // Keep stepping until scheduler is idle or D fires.
-        sched.mark_flush(); // allow B0 to fire with 2 rows.
-
-        let mut d_fired = false;
-        for _ in 0..20 {
-            if process_non_target(&mut sched, d) {
-                // D may have been processed.
-            }
-            // Check if D has fired by seeing if sink output is available or queues are idle.
-            if sched.is_idle() {
-                d_fired = true;
-                break;
-            }
-        }
-
-        assert!(d_fired, "D should have fired after all branches delivered");
+        let result = exec.run_until(d);
+        assert!(result.lineage.origins.contains(&0));
+        assert!(result.lineage.origins.contains(&1));
     }
 
     #[test]
     fn triple_fanout_common_origin() {
         // A -> {B, C, D} -> E(CommonOrigin)
         let mut graph = PipelineGraph::new();
-        let a = graph.add_task(TaskDef::passthrough("A", |b| Ok(b)));
-        let b = graph.add_task(TaskDef::passthrough("B", |b| Ok(b)));
-        let c = graph.add_task(TaskDef::passthrough("C", |b| Ok(b)));
-        let d = graph.add_task(TaskDef::passthrough("D", |b| Ok(b)));
+        let _a = graph.add_task(TaskDef::passthrough("A", |b| Ok(b)));
+        let _b = graph.add_task(TaskDef::passthrough("B", |b| Ok(b)));
+        let _c = graph.add_task(TaskDef::passthrough("C", |b| Ok(b)));
+        let _d = graph.add_task(TaskDef::passthrough("D", |b| Ok(b)));
         let e = graph.add_task(
             TaskDef::passthrough("E", |b| Ok(b)).with_batch_mode(BatchMode::CommonOrigin),
         );
-        graph.add_edge(a, b).unwrap();
-        graph.add_edge(a, c).unwrap();
-        graph.add_edge(a, d).unwrap();
-        graph.add_edge(b, e).unwrap();
-        graph.add_edge(c, e).unwrap();
-        graph.add_edge(d, e).unwrap();
+        graph.add_edge(_a, _b).unwrap();
+        graph.add_edge(_a, _c).unwrap();
+        graph.add_edge(_a, _d).unwrap();
+        graph.add_edge(_b, e).unwrap();
+        graph.add_edge(_c, e).unwrap();
+        graph.add_edge(_d, e).unwrap();
         graph.validate(&DefaultGenerator::new()).unwrap();
 
-        let transport = InMemoryTransport::new();
-        let mut sched = BatchScheduler::new(&graph, transport);
+        let mut exec = TestExecutor::new(graph);
+        exec.enqueue(&make_batch(0));
 
-        sched.enqueue_source_batch(&make_batch(0)).unwrap();
-
-        // Process all non-E tasks.
-        let mut processed_e = false;
-        for _ in 0..20 {
-            match sched.next_ready_task() {
-                Some(ready) => {
-                    if ready.node == e {
-                        // E should have 3 handles (one from each predecessor).
-                        assert_eq!(ready.handles.len(), 3);
-                        assert_eq!(ready.lineage.origins, BTreeSet::from([0]));
-                        processed_e = true;
-                        break;
-                    }
-                    let batch = sched.load_and_concat(&ready.handles).unwrap();
-                    sched.release_handles(&ready.handles).unwrap();
-                    let handle = sched.transport().store(&batch).unwrap();
-                    sched
-                        .deliver_output(ready.node, handle, ready.lineage, batch.num_rows())
-                        .unwrap();
-                }
-                None => break,
-            }
-        }
-        assert!(
-            processed_e,
-            "E should have fired with 3 predecessor contributions"
-        );
+        let result = exec.run_until(e);
+        assert_eq!(result.input_handles, 3);
+        assert_eq!(result.lineage.origins, BTreeSet::from([0]));
     }
 
     #[test]
@@ -939,7 +958,7 @@ mod tests {
                         // A (source) — deliver normally so B/C get input.
                         let handle = sched.transport().store(&batch).unwrap();
                         sched
-                            .deliver_output(ready.node, handle, lineage, batch.num_rows())
+                            .deliver_stream_output(ready.node, 0, handle, lineage, batch.num_rows())
                             .unwrap();
                     }
                 }
@@ -954,7 +973,7 @@ mod tests {
         for (batch, lineage) in &c_outputs {
             let handle = sched.transport().store(batch).unwrap();
             sched
-                .deliver_output(c, handle, lineage.clone(), batch.num_rows())
+                .deliver_stream_output(c, 0, handle, lineage.clone(), batch.num_rows())
                 .unwrap();
         }
         let b1_idx = b_outputs
@@ -964,7 +983,7 @@ mod tests {
         let (ref batch, ref lineage) = b_outputs[b1_idx];
         let handle = sched.transport().store(batch).unwrap();
         sched
-            .deliver_output(b, handle, lineage.clone(), batch.num_rows())
+            .deliver_stream_output(b, 0, handle, lineage.clone(), batch.num_rows())
             .unwrap();
 
         // D should fire for origin 1 (both B(1) and C(1) delivered),
@@ -987,12 +1006,172 @@ mod tests {
         let (ref batch, ref lineage) = b_outputs[b0_idx];
         let handle = sched.transport().store(batch).unwrap();
         sched
-            .deliver_output(b, handle, lineage.clone(), batch.num_rows())
+            .deliver_stream_output(b, 0, handle, lineage.clone(), batch.num_rows())
             .unwrap();
 
         // D should now fire for origin 0.
         let ready = sched.next_ready_task().unwrap();
         assert_eq!(ready.node, d);
         assert_eq!(ready.lineage.origins, BTreeSet::from([0]));
+    }
+
+    #[test]
+    fn multi_stream_routes_to_different_successors() {
+        // source -> splitter(2 streams) -> stream0 -> sink_a
+        //                                -> stream1 -> sink_b
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+
+        let mut graph = PipelineGraph::new();
+        let source = graph.add_task(TaskDef::passthrough("source", |b| Ok(b)));
+        let _splitter = graph.add_task(TaskDef::new_multi_stream(
+            "splitter",
+            schema.clone(),
+            vec![schema.clone(), schema.clone()],
+            |batch| Ok(vec![batch.clone(), batch]),
+        ));
+        let sink_a = graph.add_task(TaskDef::passthrough("sink_a", |b| Ok(b)));
+        let sink_b = graph.add_task(TaskDef::passthrough("sink_b", |b| Ok(b)));
+
+        graph.add_edge(source, _splitter).unwrap();
+        graph.add_edge_with_streams(_splitter, sink_a, vec![0]).unwrap();
+        graph.add_edge_with_streams(_splitter, sink_b, vec![1]).unwrap();
+        graph.validate(&DefaultGenerator::new()).unwrap();
+
+        let mut exec = TestExecutor::new(graph);
+        exec.enqueue(&make_batch(42));
+        exec.run_to_idle();
+
+        // Both sinks should have fired.
+        let mut fired: Vec<_> = exec.firings_of(sink_a).iter().chain(exec.firings_of(sink_b).iter()).map(|r| r.node).collect();
+        fired.sort();
+        let mut expected = vec![sink_a, sink_b];
+        expected.sort();
+        assert_eq!(fired, expected);
+    }
+
+    #[test]
+    fn multi_stream_fan_out_single_stream() {
+        // source -> splitter(2 streams)
+        //   stream 0 -> consumer_a AND consumer_b
+        //   stream 1 -> consumer_c
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+
+        let mut graph = PipelineGraph::new();
+        let source = graph.add_task(TaskDef::passthrough("source", |b| Ok(b)));
+        let splitter = graph.add_task(TaskDef::new_multi_stream(
+            "splitter",
+            schema.clone(),
+            vec![schema.clone(), schema.clone()],
+            |batch| Ok(vec![batch.clone(), batch]),
+        ));
+        let consumer_a = graph.add_task(TaskDef::passthrough("consumer_a", |b| Ok(b)));
+        let consumer_b = graph.add_task(TaskDef::passthrough("consumer_b", |b| Ok(b)));
+        let consumer_c = graph.add_task(TaskDef::passthrough("consumer_c", |b| Ok(b)));
+
+        graph.add_edge(source, splitter).unwrap();
+        graph.add_edge_with_streams(splitter, consumer_a, vec![0]).unwrap();
+        graph.add_edge_with_streams(splitter, consumer_b, vec![0]).unwrap();
+        graph.add_edge_with_streams(splitter, consumer_c, vec![1]).unwrap();
+        graph.validate(&DefaultGenerator::new()).unwrap();
+
+        let mut exec = TestExecutor::new(graph);
+        exec.enqueue(&make_batch(1));
+        exec.run_to_idle();
+
+        // All three consumers should have fired exactly once.
+        assert_eq!(exec.firings_of(consumer_a).len(), 1);
+        assert_eq!(exec.firings_of(consumer_b).len(), 1);
+        assert_eq!(exec.firings_of(consumer_c).len(), 1);
+    }
+
+    #[test]
+    fn multi_stream_one_branch_common_origin() {
+        // Splitter produces 2 streams:
+        //   stream 0 -> B -> D(CommonOrigin)
+        //   stream 1 -> C -> D
+        // D should fire when both B and C deliver with matching origin.
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+
+        let mut graph = PipelineGraph::new();
+        let _source = graph.add_task(TaskDef::passthrough("source", |b| Ok(b)));
+        let splitter = graph.add_task(TaskDef::new_multi_stream(
+            "splitter",
+            schema.clone(),
+            vec![Schema::empty(), Schema::empty()],
+            |batch| Ok(vec![batch.clone(), batch]),
+        ));
+        let _b = graph.add_task(TaskDef::passthrough("B", |b| Ok(b)));
+        let _c = graph.add_task(TaskDef::passthrough("C", |b| Ok(b)));
+        let d = graph.add_task(
+            TaskDef::passthrough("D", |b| Ok(b)).with_batch_mode(BatchMode::CommonOrigin),
+        );
+
+        graph.add_edge(_source, splitter).unwrap();
+        graph.add_edge_with_streams(splitter, _b, vec![0]).unwrap();
+        graph.add_edge_with_streams(splitter, _c, vec![1]).unwrap();
+        graph.add_edge(_b, d).unwrap();
+        graph.add_edge(_c, d).unwrap();
+        graph.validate(&DefaultGenerator::new()).unwrap();
+
+        let mut exec = TestExecutor::new(graph);
+        exec.enqueue(&make_batch(0));
+
+        let result = exec.run_until(d);
+        assert_eq!(result.input_handles, 2);
+        assert_eq!(result.lineage.origins, BTreeSet::from([0]));
+    }
+
+    #[test]
+    fn multi_stream_both_branches_common_origin() {
+        // Splitter produces 2 streams, each feeding a separate CommonOrigin join:
+        //   stream 0 -> B0 -> join_0(CommonOrigin)
+        //   stream 1 -> B1 -> join_1(CommonOrigin)
+        //   source2       -> join_0
+        //   source2       -> join_1
+        //
+        // Both join nodes should fire independently when their predecessors deliver.
+        let schema = Schema::new(vec![Field::new("id", DataType::Int64, false)]);
+
+        let mut graph = PipelineGraph::new();
+        let _source = graph.add_task(TaskDef::passthrough("source", |b| Ok(b)));
+        let splitter = graph.add_task(TaskDef::new_multi_stream(
+            "splitter",
+            schema.clone(),
+            vec![Schema::empty(), Schema::empty()],
+            |batch| Ok(vec![batch.clone(), batch]),
+        ));
+        let _b0 = graph.add_task(TaskDef::passthrough("B0", |b| Ok(b)));
+        let _b1 = graph.add_task(TaskDef::passthrough("B1", |b| Ok(b)));
+        let _source2 = graph.add_task(TaskDef::passthrough("source2", |b| Ok(b)));
+        let join_0 = graph.add_task(
+            TaskDef::passthrough("join_0", |b| Ok(b)).with_batch_mode(BatchMode::CommonOrigin),
+        );
+        let join_1 = graph.add_task(
+            TaskDef::passthrough("join_1", |b| Ok(b)).with_batch_mode(BatchMode::CommonOrigin),
+        );
+
+        graph.add_edge(_source, splitter).unwrap();
+        graph.add_edge_with_streams(splitter, _b0, vec![0]).unwrap();
+        graph.add_edge_with_streams(splitter, _b1, vec![1]).unwrap();
+        graph.add_edge(_b0, join_0).unwrap();
+        graph.add_edge(_b1, join_1).unwrap();
+        graph.add_edge(_source2, join_0).unwrap();
+        graph.add_edge(_source2, join_1).unwrap();
+        graph.validate(&DefaultGenerator::new()).unwrap();
+
+        let mut exec = TestExecutor::new(graph);
+        exec.enqueue(&make_batch(0));
+        exec.run_to_idle();
+
+        // Both joins should have fired with 2 handles and matching origin.
+        let j0 = exec.firings_of(join_0);
+        assert_eq!(j0.len(), 1);
+        assert_eq!(j0[0].input_handles, 2);
+        assert_eq!(j0[0].lineage.origins, BTreeSet::from([0]));
+
+        let j1 = exec.firings_of(join_1);
+        assert_eq!(j1.len(), 1);
+        assert_eq!(j1[0].input_handles, 2);
+        assert_eq!(j1[0].lineage.origins, BTreeSet::from([0]));
     }
 }

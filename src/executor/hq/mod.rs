@@ -478,6 +478,7 @@ impl<B: HqBackend, T: DataTransport> HqIter<'_, B, T> {
                                 new_lineage.origins = entry.origins;
                                 self.route_to_successors(
                                     node,
+                                    entry.stream,
                                     entry.handle,
                                     new_lineage.clone(),
                                     entry.num_rows,
@@ -524,15 +525,16 @@ impl<B: HqBackend, T: DataTransport> HqIter<'_, B, T> {
         Ok(())
     }
 
-    /// Route a task's output to each successor individually.
+    /// Route a task's output from a specific stream to each stream-specific successor.
     fn route_to_successors(
         &mut self,
         from: NodeIndex,
+        stream: u32,
         handle: T::Handle,
         lineage: BatchLineage,
         num_rows: usize,
     ) -> Result<()> {
-        let succs: Vec<NodeIndex> = self.scheduler.successors_of(from).to_vec();
+        let succs: Vec<NodeIndex> = self.scheduler.stream_successors_of(from, stream).to_vec();
 
         if succs.is_empty() {
             self.scheduler.transport().release(&handle)?;

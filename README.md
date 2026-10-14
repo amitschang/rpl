@@ -36,6 +36,15 @@ runs:
 These are declared per-task and handled entirely by the scheduler — no manual
 batching logic required.
 
+### Multi-stream task outputs
+
+A task can produce multiple output streams, each routed to different downstream
+consumers via stream-annotated edges. The graph validates at construction time
+that every stream is wired to at least one successor and that sink tasks produce
+exactly one stream. This enables splitter patterns — e.g. a task that partitions
+rows into "accepted" and "rejected" streams — without requiring downstream tasks
+to filter.
+
 ### Pluggable executors, shared scheduling
 
 The `BatchScheduler` — which manages queues, origin tracking, accumulation, and
@@ -217,3 +226,53 @@ tracker.print_summary(); // final table on stdout
 Use `tracker.update(&output)` instead of `update_and_report` for silent
 accumulation — useful when you only want the final summary or need to inspect
 `tracker.summary()` programmatically.
+
+### Multi-stream routing
+
+A task can produce multiple output streams, each routed to a different successor
+via stream-annotated edges. Tasks producing multiple streams return a vector of
+`RecordBatch`es, one for each stream and declare the schema for each stream.
+Edges accept one or more stream indices to specify which streams are routed to
+which successors (without annotations an implicit stream = 0 is routed). The
+graph validates that every stream is wired to at least one successor.
+
+```rust
+use arrow::datatypes::{DataType, Field, Schema};
+use rpl::{DefaultGenerator, PipelineGraph, TaskDef, schema_of};
+
+let schema = Schema::new(vec![Field::new("score", DataType::Float64, false)]);
+
+let mut graph = PipelineGraph::new();
+
+// Source produces a "score" column. Note the single-stream `TaskDef::new` variant,
+// which implicitly wraps the single batch to form a single stream output.
+let source = graph.add_task(TaskDef::new(
+    "score",
+    Schema::empty(),
+    schema_of(&[("score", DataType::Float64)]),
+    |batch| { /* ... */ Ok(batch) },
+));
+
+// Splitter emits two streams: stream 0 = accepted, stream 1 = rejected. The task function
+// in the multi-stream variant must return a vector of batches, one per stream.
+let splitter = graph.add_task(TaskDef::new_multi_stream(
+    "filter",
+    schema_of(&[("score", DataType::Float64)]),
+    vec![schema.clone(), schema.clone()],
+    |batch| {
+        // Partition rows into accepted/rejected based on some criteria.
+        let accepted = batch.clone(); // placeholder
+        let rejected = batch;
+        Ok(vec![accepted, rejected])
+    },
+));
+
+let accepted_sink = graph.add_task(TaskDef::passthrough("save_accepted", |b| Ok(b)));
+let rejected_sink = graph.add_task(TaskDef::passthrough("save_rejected", |b| Ok(b)));
+
+graph.add_edge(source, splitter).unwrap();
+graph.add_edge_with_streams(splitter, accepted_sink, vec![0]).unwrap();
+graph.add_edge_with_streams(splitter, rejected_sink, vec![1]).unwrap();
+
+graph.validate(&DefaultGenerator::new()).unwrap();
+```

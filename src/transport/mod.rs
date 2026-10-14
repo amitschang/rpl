@@ -28,6 +28,9 @@ pub struct OutputEntry<H> {
     pub handle: H,
     pub num_rows: usize,
     pub origins: BTreeSet<u64>,
+    /// Output stream index (0 for single-stream tasks).
+    #[serde(default)]
+    pub stream: u32,
     /// Task execution time in milliseconds (worker-measured).
     /// `None` for split-only operations.
     #[serde(default)]
@@ -41,6 +44,7 @@ impl<H> OutputEntry<H> {
             handle: f(self.handle),
             num_rows: self.num_rows,
             origins: self.origins,
+            stream: self.stream,
             exec_duration_ms: self.exec_duration_ms,
         }
     }

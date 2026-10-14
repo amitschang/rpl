@@ -23,6 +23,16 @@ use crate::executor::SourceGenerator;
 use crate::schema::ColumnSet;
 use crate::task::TaskDef;
 
+/// Metadata on a data-flow edge.
+///
+/// Each edge carries the set of output stream indices from the source task
+/// that should be delivered to the target task. For single-stream tasks
+/// this is always `vec![0]`.
+#[derive(Clone, Debug)]
+pub struct EdgeDef {
+    pub streams: Vec<u32>,
+}
+
 /// A reference to a task within a [`PipelineGraph`].
 ///
 /// Derefs to [`TaskDef`], so task methods and fields (e.g. `node.name`,
@@ -48,7 +58,7 @@ impl std::ops::Deref for Node<'_> {
 /// becomes input of downstream). Schema compatibility is validated when
 /// edges are added.
 pub struct PipelineGraph {
-    graph: DiGraph<TaskDef, ()>,
+    graph: DiGraph<TaskDef, EdgeDef>,
 }
 
 impl PipelineGraph {
@@ -63,12 +73,26 @@ impl PipelineGraph {
         self.graph.add_node(task)
     }
 
-    /// Connect two tasks with a data-flow edge.
+    /// Connect two tasks with a data-flow edge on stream 0.
     ///
     /// Rejects edges that would create a cycle. Schema validation is
     /// deferred to [`validate()`](PipelineGraph::validate).
     pub fn add_edge(&mut self, from: NodeIndex, to: NodeIndex) -> Result<()> {
-        self.graph.add_edge(from, to, ());
+        self.add_edge_with_streams(from, to, vec![0])
+    }
+
+    /// Connect two tasks with a data-flow edge carrying specific stream indices.
+    ///
+    /// `streams` must be non-empty. Each value identifies an output stream
+    /// of the `from` task whose batches will be delivered to `to`.
+    pub fn add_edge_with_streams(
+        &mut self,
+        from: NodeIndex,
+        to: NodeIndex,
+        streams: Vec<u32>,
+    ) -> Result<()> {
+        assert!(!streams.is_empty(), "edge streams must be non-empty");
+        self.graph.add_edge(from, to, EdgeDef { streams });
 
         // Check for cycles after adding the edge.
         if is_cyclic_directed(&self.graph) {
@@ -177,11 +201,23 @@ impl PipelineGraph {
             .collect()
     }
 
-    /// Successor node indices (downstream tasks).
-    pub fn successors(&self, node: NodeIndex) -> Vec<NodeIndex> {
+    /// Successor node indices with their stream labels.
+    ///
+    /// Returns `(target_node, streams)` for each outgoing edge.
+    pub fn successors_with_streams(&self, node: NodeIndex) -> Vec<(NodeIndex, Vec<u32>)> {
         self.graph
             .edges_directed(node, Direction::Outgoing)
-            .map(|e| e.target())
+            .map(|e| (e.target(), e.weight().streams.clone()))
+            .collect()
+    }
+
+    /// Incoming edges with their stream labels.
+    ///
+    /// Returns `(source_node, streams)` for each incoming edge.
+    pub fn predecessors_with_streams(&self, node: NodeIndex) -> Vec<(NodeIndex, Vec<u32>)> {
+        self.graph
+            .edges_directed(node, Direction::Incoming)
+            .map(|e| (e.source(), e.weight().streams.clone()))
             .collect()
     }
 
@@ -217,6 +253,37 @@ impl PipelineGraph {
             return Err(RplError::GraphError("graph has no sink tasks".into()));
         }
 
+        // Validate stream indices on all edges.
+        for node_idx in self.graph.node_indices() {
+            let task = &self.graph[node_idx];
+            let num_streams = task.num_output_streams();
+
+            if self.is_sink(node_idx) {
+                // Sink tasks must produce exactly one output stream.
+                if num_streams != 1 {
+                    return Err(RplError::GraphError(format!(
+                        "sink task '{}' has {num_streams} output streams, but sink tasks must have exactly 1",
+                        task.name,
+                    )));
+                }
+            } else {
+                // Non-sink tasks: every output stream must appear on at least one outgoing edge.
+                let wired: std::collections::HashSet<u32> = self
+                    .successors_with_streams(node_idx)
+                    .into_iter()
+                    .flat_map(|(_, streams)| streams)
+                    .collect();
+                let all= std::collections::HashSet::from_iter(0..num_streams as u32);
+                if all.symmetric_difference(&wired).next().is_some() {
+                    return Err(RplError::GraphError(format!(
+                        "task '{}' has {num_streams} output streams but streams {:?} are referenced in outgoing edges; \
+                         all streams must be wired to a successor and must be valid",
+                        task.name, wired,
+                    )));
+                }
+            }
+        }
+
         // Topological sort (guaranteed to succeed since we checked acyclicity).
         let topo = toposort(&self.graph, None)
             .map_err(|_| RplError::GraphError("graph contains a cycle".into()))?;
@@ -224,20 +291,40 @@ impl PipelineGraph {
         let source_set: std::collections::HashSet<NodeIndex> = sources.into_iter().collect();
         let seed = ColumnSet::from_schema(source.produces());
 
-        let mut available_at: HashMap<NodeIndex, ColumnSet> = HashMap::new();
+        // Track per-stream available columns at each node.
+        // For a node with N output streams, available_at stores the columns
+        // available *after* applying each stream's produces/drops.
+        let mut available_at: HashMap<NodeIndex, Vec<ColumnSet>> = HashMap::new();
 
         for node_idx in topo {
             let task = &self.graph[node_idx];
-            let preds = self.predecessors(node_idx);
+            let incoming = self.predecessors_with_streams(node_idx);
 
-            // Compute available columns at this node.
-            let mut available = if preds.is_empty() {
+            // Compute available columns arriving at this node from all incoming edges.
+            let available = if incoming.is_empty() {
                 // Source node: seeded by the generator.
                 assert!(source_set.contains(&node_idx));
                 seed.clone()
             } else {
-                // Merge: intersection of all predecessor outputs.
-                let mut iter = preds.iter().map(|p| available_at[p].clone());
+                // Merge: for each incoming edge, compute the union of columns
+                // across all streams on that edge, then intersect across edges.
+                let mut edge_column_sets: Vec<ColumnSet> = Vec::new();
+                for (pred, streams) in &incoming {
+                    let pred_outputs = &available_at[pred];
+                    // Union columns across all streams on this edge.
+                    let mut edge_cols: Option<ColumnSet> = None;
+                    for &stream in streams {
+                        let stream_cols = &pred_outputs[stream as usize];
+                        edge_cols = Some(match edge_cols {
+                            None => stream_cols.clone(),
+                            Some(acc) => acc.intersect(stream_cols),
+                        });
+                    }
+                    if let Some(cols) = edge_cols {
+                        edge_column_sets.push(cols);
+                    }
+                }
+                let mut iter = edge_column_sets.into_iter();
                 let first = iter.next().unwrap();
                 iter.fold(first, |acc, cs| acc.intersect(&cs))
             };
@@ -248,10 +335,16 @@ impl PipelineGraph {
             // Validate drops.
             available.contains_all(task.drops(), &task.name)?;
 
-            // Apply this task's effect.
-            available.apply(task.produces(), task.drops());
+            // Build per-stream output column sets.
+            let num_streams = task.num_output_streams();
+            let mut stream_outputs = Vec::with_capacity(num_streams);
+            for stream_schema in task.produces() {
+                let mut stream_available = available.clone();
+                stream_available.apply(stream_schema, task.drops());
+                stream_outputs.push(stream_available);
+            }
 
-            available_at.insert(node_idx, available);
+            available_at.insert(node_idx, stream_outputs);
         }
 
         Ok(())
@@ -288,7 +381,7 @@ impl PipelineGraph {
     }
 
     /// Reference to the underlying petgraph.
-    pub fn inner(&self) -> &DiGraph<TaskDef, ()> {
+    pub fn inner(&self) -> &DiGraph<TaskDef, EdgeDef> {
         &self.graph
     }
 
@@ -331,8 +424,14 @@ impl PipelineGraph {
         writeln!(out)?;
         writeln!(out, "Edges:")?;
         for node in self.nodes() {
-            for succ in self.successors(node.index) {
-                writeln!(out, "  {} -> {}", node.name, self.task(succ).name)?;
+            for (succ, streams) in self.successors_with_streams(node.index) {
+                writeln!(
+                    out,
+                    "  {} -> {} (streams={:?})",
+                    node.name,
+                    self.task(succ).name,
+                    streams,
+                )?;
             }
         }
 
@@ -528,5 +627,198 @@ mod tests {
         assert_eq!(ranks[&ids[2]], 0);
         assert_eq!(ranks[&ids[1]], 1);
         assert_eq!(ranks[&ids[0]], 2);
+    }
+
+    #[test]
+    fn multi_stream_validation_accepts_valid_streams() {
+        // A produces 2 streams, stream 0 -> B, stream 1 -> C.
+        let mut g = PipelineGraph::new();
+        let a = g.add_task(TaskDef::new_multi_stream(
+            "A",
+            schema_of(&[("id", DataType::Int64)]),
+            vec![
+                schema_of(&[("a_out", DataType::Float64)]),
+                schema_of(&[("b_out", DataType::Utf8)]),
+            ],
+            |batch| Ok(vec![batch.clone(), batch]),
+        ));
+        let b = g.add_task(TaskDef::new(
+            "B",
+            schema_of(&[("a_out", DataType::Float64)]),
+            Schema::empty(),
+            |batch| Ok(batch),
+        ));
+        let c = g.add_task(TaskDef::new(
+            "C",
+            schema_of(&[("b_out", DataType::Utf8)]),
+            Schema::empty(),
+            |batch| Ok(batch),
+        ));
+        g.add_edge_with_streams(a, b, vec![0]).unwrap();
+        g.add_edge_with_streams(a, c, vec![1]).unwrap();
+        assert!(g.validate(&DefaultGenerator::new()).is_ok());
+    }
+
+    #[test]
+    fn multi_stream_invalid_stream_index_rejected() {
+        // A has 1 output stream but edge references stream 1.
+        let mut g = PipelineGraph::new();
+        let a = g.add_task(passthrough_task("A"));
+        let b = g.add_task(passthrough_task("B"));
+        g.add_edge_with_streams(a, b, vec![1]).unwrap();
+        let err = g.validate(&DefaultGenerator::new()).unwrap_err();
+        assert!(
+            err.to_string().contains("has 1 output streams but streams {1} are referenced") &&
+             err.to_string().contains("all streams must be wired to a successor and must be valid"),
+            "expected stream index error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn multi_stream_schema_mismatch_rejected() {
+        // A produces 2 streams: stream 0 has {x_col}, stream 1 has {y_col}.
+        // B requires {y_col} but receives stream 0 (which only has {x_col}).
+        let mut g = PipelineGraph::new();
+        let a = g.add_task(TaskDef::new_multi_stream(
+            "A",
+            schema_of(&[("id", DataType::Int64)]),
+            vec![
+                schema_of(&[("x_col", DataType::Int32)]),
+                schema_of(&[("y_col", DataType::Int32)]),
+            ],
+            |batch| Ok(vec![batch.clone(), batch]),
+        ));
+        let b = g.add_task(TaskDef::new(
+            "B",
+            schema_of(&[("y_col", DataType::Int32)]),
+            Schema::empty(),
+            |batch| Ok(batch),
+        ));
+        // Wire stream 0 to B — B needs y_col which only stream 1 has.
+        g.add_edge_with_streams(a, b, vec![0]).unwrap();
+        assert!(g.validate(&DefaultGenerator::new()).is_err());
+    }
+
+    #[test]
+    fn multi_stream_edge_with_multiple_streams() {
+        // A produces 2 streams with different schemas.
+        // B receives both streams via a single edge — available columns are
+        // the intersection of the two stream schemas (plus seed columns).
+        let mut g = PipelineGraph::new();
+        let a = g.add_task(TaskDef::new_multi_stream(
+            "A",
+            schema_of(&[("id", DataType::Int64)]),
+            vec![
+                schema_of(&[("common", DataType::Int32), ("only_s0", DataType::Int32)]),
+                schema_of(&[("common", DataType::Int32), ("only_s1", DataType::Int32)]),
+            ],
+            |batch| Ok(vec![batch.clone(), batch]),
+        ));
+        // B requires "common" which both streams produce — should pass.
+        let b = g.add_task(TaskDef::new(
+            "B",
+            schema_of(&[("common", DataType::Int32)]),
+            Schema::empty(),
+            |batch| Ok(batch),
+        ));
+        g.add_edge_with_streams(a, b, vec![0, 1]).unwrap();
+        assert!(g.validate(&DefaultGenerator::new()).is_ok());
+
+        // C requires "only_s0" which only stream 0 has — fails with both streams.
+        let mut g2 = PipelineGraph::new();
+        let a2 = g2.add_task(TaskDef::new_multi_stream(
+            "A",
+            schema_of(&[("id", DataType::Int64)]),
+            vec![
+                schema_of(&[("common", DataType::Int32), ("only_s0", DataType::Int32)]),
+                schema_of(&[("common", DataType::Int32), ("only_s1", DataType::Int32)]),
+            ],
+            |batch| Ok(vec![batch.clone(), batch]),
+        ));
+        let c = g2.add_task(TaskDef::new(
+            "C",
+            schema_of(&[("only_s0", DataType::Int32)]),
+            Schema::empty(),
+            |batch| Ok(batch),
+        ));
+        g2.add_edge_with_streams(a2, c, vec![0, 1]).unwrap();
+        assert!(g2.validate(&DefaultGenerator::new()).is_err());
+    }
+
+    #[test]
+    fn multi_stream_successors_with_streams() {
+        let mut g = PipelineGraph::new();
+        let a = g.add_task(TaskDef::new_multi_stream(
+            "A",
+            Schema::empty(),
+            vec![Schema::empty(), Schema::empty(), Schema::empty()],
+            |_| Ok(vec![]),
+        ));
+        let b = g.add_task(passthrough_task("B"));
+        let c = g.add_task(passthrough_task("C"));
+
+        g.add_edge_with_streams(a, b, vec![0, 2]).unwrap();
+        g.add_edge_with_streams(a, c, vec![1]).unwrap();
+
+        let succs = g.successors_with_streams(a);
+        assert_eq!(succs.len(), 2);
+        // Find the edge to B and C.
+        let to_b = succs.iter().find(|(n, _)| *n == b).unwrap();
+        let to_c = succs.iter().find(|(n, _)| *n == c).unwrap();
+        assert_eq!(to_b.1, vec![0, 2]);
+        assert_eq!(to_c.1, vec![1]);
+    }
+
+    #[test]
+    fn multi_stream_sink_rejected() {
+        // Sink task with 2 output streams should be rejected.
+        let mut g = PipelineGraph::new();
+        g.add_task(TaskDef::new_multi_stream(
+            "multi_sink",
+            schema_of(&[("id", DataType::Int64)]),
+            vec![Schema::empty(), Schema::empty()],
+            |batch| Ok(vec![batch.clone(), batch]),
+        ));
+        let err = g.validate(&DefaultGenerator::new()).unwrap_err();
+        assert!(
+            err.to_string().contains("sink task") && err.to_string().contains("exactly 1"),
+            "expected sink stream count error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn unwired_stream_rejected() {
+        // A produces 2 streams but only stream 0 is wired.
+        let mut g = PipelineGraph::new();
+        let a = g.add_task(TaskDef::new_multi_stream(
+            "A",
+            schema_of(&[("id", DataType::Int64)]),
+            vec![Schema::empty(), Schema::empty()],
+            |batch| Ok(vec![batch.clone(), batch]),
+        ));
+        let b = g.add_task(passthrough_task("B"));
+        g.add_edge_with_streams(a, b, vec![0]).unwrap();
+        let err = g.validate(&DefaultGenerator::new()).unwrap_err();
+        assert!(
+            err.to_string().contains("all streams must be wired"),
+            "expected unwired stream error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn all_streams_wired_accepted() {
+        // A produces 2 streams, both wired — should pass.
+        let mut g = PipelineGraph::new();
+        let a = g.add_task(TaskDef::new_multi_stream(
+            "A",
+            schema_of(&[("id", DataType::Int64)]),
+            vec![Schema::empty(), Schema::empty()],
+            |batch| Ok(vec![batch.clone(), batch]),
+        ));
+        let b = g.add_task(passthrough_task("B"));
+        let c = g.add_task(passthrough_task("C"));
+        g.add_edge_with_streams(a, b, vec![0]).unwrap();
+        g.add_edge_with_streams(a, c, vec![1]).unwrap();
+        assert!(g.validate(&DefaultGenerator::new()).is_ok());
     }
 }

@@ -126,21 +126,31 @@ fn run_execute<T: DataTransport>(
     // Look up and execute the task, measuring execution time.
     let task = registry.build(task_name)?;
     let exec_start = Instant::now();
-    let output = task.execute(input)?;
+    let outputs = task.execute(input)?;
     let exec_duration_ms = exec_start.elapsed().as_millis() as u64;
 
-    // Publish output via the transport.
-    let num_rows = output.num_rows();
-    let handle = transport.store(&output)?;
-    transport.publish_output(
-        &common.output_token,
-        &[OutputEntry {
-            handle,
-            num_rows,
-            origins: common.origins,
-            exec_duration_ms: Some(exec_duration_ms),
-        }],
-    )
+    // Publish each stream output via the transport.
+    let entries: Vec<OutputEntry<T::Handle>> = outputs
+        .into_iter()
+        .enumerate()
+        .map(|(stream, output)| {
+            let num_rows = output.num_rows();
+            let handle = transport.store(&output)?;
+            Ok(OutputEntry {
+                handle,
+                num_rows,
+                origins: common.origins.clone(),
+                exec_duration_ms: if stream == 0 {
+                    Some(exec_duration_ms)
+                } else {
+                    None
+                },
+                stream: stream as u32,
+            })
+        })
+        .collect::<Result<_>>()?;
+
+    transport.publish_output(&common.output_token, &entries)
 }
 
 /// Split mode: load input, split into chunks, store each chunk.
@@ -163,6 +173,7 @@ fn run_split<T: DataTransport>(
                 num_rows: chunk.num_rows(),
                 origins: common.origins.clone(),
                 exec_duration_ms: None,
+                stream: 0,
             })
         })
         .collect::<Result<_>>()?;
